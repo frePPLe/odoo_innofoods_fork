@@ -16,19 +16,156 @@
 # License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 import logging
+import pytz
+import xmlrpc.client
 from xml.sax.saxutils import quoteattr
 from datetime import datetime, timedelta
-from operator import itemgetter
+from pytz import timezone
+import ssl
 
-import odoo
+try:
+    import odoo
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
 
 
+class Odoo_generator:
+    def __init__(self, env):
+        self.env = env
+
+    def setContext(self, **kwargs):
+        t = dict(self.env.context)
+        t.update(kwargs)
+        self.env = self.env(
+            user=self.env.user,
+            context=t,
+        )
+
+    def callMethod(self, model, id, method, args=[]):
+        for obj in self.env[model].browse(id):
+            return getattr(obj, method)(*args)
+        return None
+
+    def getData(self, model, search=[], order=None, fields=[], ids=None):
+        if ids is not None:
+            return self.env[model].browse(ids).read(fields) if ids else []
+        if order:
+            return self.env[model].search(search, order=order).read(fields)
+        else:
+            return self.env[model].search(search).read(fields)
+
+
+class XMLRPC_generator:
+
+    pagesize = 5000
+
+    def __init__(self, url, db, username, password):
+        self.db = db
+        self.password = password
+        self.env = xmlrpc.client.ServerProxy(
+            "{}/xmlrpc/2/common".format(url),
+            context=ssl._create_unverified_context(),
+        )
+        self.uid = self.env.authenticate(db, username, password, {})
+        self.env = xmlrpc.client.ServerProxy(
+            "{}/xmlrpc/2/object".format(url),
+            context=ssl._create_unverified_context(),
+            use_builtin_types=True,
+            headers={"Connection": "keep-alive"}.items(),
+        )
+        self.context = {}
+
+    def setContext(self, **kwargs):
+        self.context.update(kwargs)
+
+    def callMethod(self, model, id, method, args):
+        return self.env.execute_kw(
+            self.db, self.uid, self.password, model, method, [id], []
+        )
+
+    def getData(self, model, search=None, order="id asc", fields=[], ids=[]):
+        if ids:
+            page_ids = [ids]
+        else:
+            page_ids = []
+            offset = 0
+            msg = {
+                "limit": self.pagesize,
+                "offset": offset,
+                "context": self.context,
+                "order": order,
+            }
+            while True:
+                extra_ids = self.env.execute_kw(
+                    self.db,
+                    self.uid,
+                    self.password,
+                    model,
+                    "search",
+                    [search] if search else [[]],
+                    msg,
+                )
+                if not extra_ids:
+                    break
+                page_ids.append(extra_ids)
+                offset += self.pagesize
+                msg["offset"] = offset
+        if page_ids and page_ids != [[]]:
+            data = []
+            for page in page_ids:
+                data.extend(
+                    self.env.execute_kw(
+                        self.db,
+                        self.uid,
+                        self.password,
+                        model,
+                        "read",
+                        [page],
+                        {"fields": fields, "context": self.context},
+                    )
+                )
+            return data
+        else:
+            return []
+
+
 class exporter(object):
-    def __init__(self, req, uid, database=None, company=None, mode=1):
+    def __init__(
+        self,
+        generator,
+        req,
+        uid,
+        database=None,
+        company=None,
+        mode=1,
+        timezone=None,
+        singlecompany=False,
+    ):
         self.database = database
         self.company = company
+        self.generator = generator
+        self.timezone = timezone
+        if timezone:
+            if timezone not in pytz.all_timezones:
+                logger.warning("Invalid timezone URL argument: %s." % (timezone,))
+                self.timezone = None
+            else:
+                # Valid timezone override in the url
+                self.timezone = timezone
+        if not self.timezone:
+            # Default timezone: use the timezone of the connector user (or UTC if not set)
+            for i in self.generator.getData(
+                "res.users",
+                ids=[
+                    uid,
+                ],
+                fields=["tz"],
+            ):
+                self.timezone = i["tz"] or "UTC"
+        self.timeformat = "%Y-%m-%dT%H:%M:%S"
+        self.singlecompany = singlecompany
 
         # The mode argument defines different types of runs:
         #  - Mode 1:
@@ -47,15 +184,12 @@ class exporter(object):
         # Which data elements belong to each mode can vary between implementations.
         self.mode = mode
 
-        # Initialize an environment
-        self.env = req.env
-
     def run(self):
         # Check if we manage by work orders or manufacturing orders.
         self.manage_work_orders = False
-        m = self.env["ir.model"]
-        recs = m.search([("model", "=", "mrp.workorder")])
-        for rec in recs:
+        for rec in self.generator.getData(
+            "ir.model", search=[("model", "=", "mrp.workorder")], fields=["name"]
+        ):
             self.manage_work_orders = True
 
         # Load some auxiliary data in memory
@@ -88,6 +222,9 @@ class exporter(object):
             logger.debug("Exporting suppliers.")
             for i in self.export_suppliers():
                 yield i
+            logger.debug("Exporting skills.")
+            for i in self.export_skills():
+                yield i
             logger.debug("Exporting workcenters.")
             for i in self.export_workcenters():
                 yield i
@@ -108,6 +245,9 @@ class exporter(object):
             logger.debug("Exporting manufacturing orders.")
             for i in self.export_manufacturingorders():
                 yield i
+            logger.debug("Exporting minimum stock levels.")
+            for i in self.export_minimum_stock_level():
+                yield i
             logger.debug("Exporting reordering rules.")
             for i in self.export_orderpoints():
                 yield i
@@ -119,36 +259,40 @@ class exporter(object):
         yield "</plan>\n"
 
     def load_company(self):
-        m = self.env["res.company"]
-        recs = m.search([("name", "=", self.company)])
-        fields = [
-            "security_lead",
-            "po_lead",
-            "manufacturing_lead",
-            "calendar",
-            "manufacturing_warehouse",
-        ]
         self.company_id = 0
-        for i in recs.read(fields):
+        for i in self.generator.getData(
+            "res.company",
+            search=[("name", "=", self.company)],
+            fields=[
+                "security_lead",
+                "po_lead",
+                "manufacturing_lead",
+                "calendar",
+                "manufacturing_warehouse",
+            ],
+        ):
             self.company_id = i["id"]
             self.security_lead = int(
                 i["security_lead"]
             )  # TODO NOT USED RIGHT NOW - add parameter in frepple for this
             self.po_lead = i["po_lead"]
             self.manufacturing_lead = i["manufacturing_lead"]
-            self.calendar = i["calendar"] and i["calendar"][1] or "Working hours"
+            self.calendar = i["calendar"] and i["calendar"][1] or None
             self.mfg_location = (
                 i["manufacturing_warehouse"]
                 and i["manufacturing_warehouse"][1]
                 or self.company
             )
+            if self.singlecompany:
+                # Create a new context to limit the data to the selected company
+                self.generator.setContext(allowed_company_ids=[i["id"]])
         if not self.company_id:
             logger.warning("Can't find company '%s'" % self.company)
             self.company_id = None
             self.security_lead = 0
             self.po_lead = 0
             self.manufacturing_lead = 0
-            self.calendar = "Working hours"
+            self.calendar = None
             self.mfg_location = self.company
 
     def load_uom(self):
@@ -158,14 +302,15 @@ class exporter(object):
         All quantities are sent to frePPLe as numbers, expressed in the default
         unit of measure of the uom dimension.
         """
-        m = self.env["uom.uom"]
-        # We also need to load INactive UOMs, because there still might be records
-        # using the inactive UOM. Questionable practice, but can happen...
-        recs = m.search(["|", ("active", "=", 1), ("active", "=", 0)])
-        fields = ["factor", "uom_type", "category_id", "name"]
         self.uom = {}
         self.uom_categories = {}
-        for i in recs.read(fields):
+        for i in self.generator.getData(
+            "uom.uom",
+            # We also need to load INactive UOMs, because there still might be records
+            # using the inactive UOM. Questionable practice, but can happen...
+            search=["|", ("active", "=", 1), ("active", "=", 0)],
+            fields=["factor", "uom_type", "category_id", "name"],
+        ):
             if i["uom_type"] == "reference":
                 f = 1.0
                 self.uom_categories[i["category_id"][0]] = i["id"]
@@ -186,7 +331,10 @@ class exporter(object):
         """
         Convert a quantity to the reference uom of the product template.
         """
-
+        try:
+            uom_id = uom_id[0]
+        except Exception as e:
+            pass
         if not uom_id:
             return qty
         if not product_template_id:
@@ -209,11 +357,11 @@ class exporter(object):
             )
             return qty * self.uom[uom_id]["factor"]
 
-    def convert_float_time(self, float_time):
+    def convert_float_time(self, float_time, units="days"):
         """
         Convert Odoo float time to ISO 8601 duration.
         """
-        d = timedelta(days=float_time)
+        d = timedelta(**{units: float_time})
         return "P%dDT%dH%dM%dS" % (
             d.days,  # duration: days
             int(d.seconds / 3600),  # duration: hours
@@ -221,94 +369,131 @@ class exporter(object):
             int(d.seconds % 60),  # duration: seconds
         )
 
+    def formatDateTime(self, d, tmzone=None):
+        if not isinstance(d, datetime):
+            d = datetime.fromisoformat(d)
+        return d.astimezone(timezone(tmzone or self.timezone)).strftime(self.timeformat)
+
     def export_calendar(self):
         """
-        Build a calendar with a) holidays and b) working hours.
+        Reads all calendars from resource.calendar model and creates a calendar in frePPLe.
+        Attendance times are read from resource.calendar.attendance
+        Leave times are read from resource.calendar.leaves
 
-        The holidays are obtained from the hr.holidays.public.line model.
-        If the hr module isn't installed, no public holidays will be defined.
+        resource.calendar.name -> calendar.name (default value is 0)
+        resource.calendar.attendance.date_from -> calendar bucket start date (or 2000-01-01 if unspecified)
+        resource.calendar.attendance.date_to -> calendar bucket end date (or 2030-01-01 if unspecified)
+        resource.calendar.attendance.hour_from -> calendar bucket start time
+        resource.calendar.attendance.hour_to -> calendar bucket end time
+        resource.calendar.attendance.dayofweek -> calendar bucket day
 
-        The working hours are extracted from a resource.calendar model.
-        The calendar to use is configured with the company parameter "calendar".
-        If left unspecified we assume 24*7 working hours.
+        resource.calendar.leaves.date_from -> calendar bucket start date
+        resource.calendar.leaves.date_to -> calendar bucket end date
 
-        The odoo model is not ideal and nice for frePPLe, and the current mapping
-        is an as-good-as-it-gets workaround.
-
-        Mapping:
-        res.company.calendar  -> calendar.name
-        (if no working hours are defined then 1 else 0) -> calendar.default_value
-
-        resource.calendar.attendance.date_from -> calendar_bucket.start
-        '1' -> calendar_bucket.value
-        resource.calendar.attendance.dayofweek -> calendar_bucket.days
-        resource.calendar.attendance.hour_from -> calendar_bucket.startime
-        resource.calendar.attendance.hour_to -> calendar_bucket.endtime
-        computed -> calendar_bucket.priority
-
-        hr.holidays.public.line.start -> calendar_bucket.start
-        hr.holidays.public.line.start + 1 day -> calendar_bucket.end
-        '0' -> calendar_bucket.value
-        '1' -> calendar_bucket.priority
         """
         yield "<!-- calendar -->\n"
         yield "<calendars>\n"
+
+        calendars = {}
+        cal_tz = {}
+        cal_ids = set()
         try:
-            m = self.env["resource.calendar"]
-            recs = m.search([("name", "=", self.calendar)])
-            rec = recs.read(["attendance_ids"], limit=1)
-            fields = ["dayofweek", "date_from", "hour_from", "hour_to"]
-            buckets = []
-            for i in rec["attendance_ids"].read(fields):
-                strt = datetime.strptime(i["date_from"] or "2000-01-01", "%Y-%m-%d")
-                buckets.append(
-                    (
-                        strt,
-                        '<bucket start="%sT00:00:00" value="1" days="%s" priority="%%s" starttime="%s" endtime="%s"/>\n'
-                        % (
-                            strt.strftime("%Y-%m-%d"),
-                            2 ** ((int(i["dayofweek"]) + 1) % 7),
-                            # In odoo, monday = 0. In frePPLe, sunday = 0.
-                            "PT%dM" % round(i["hour_from"] * 60),
-                            "PT%dM" % round(i["hour_to"] * 60),
-                        ),
+            logger.info("Entering calendars")
+            # Read the timezone
+            for i in self.generator.getData(
+                "resource.calendar",
+                search=[("name", "!=", "Holyday")],
+                fields=[
+                    "name",
+                    "tz",
+                ],
+            ):
+                cal_tz[i["name"]] = i["tz"]
+                cal_ids.add(i["id"])
+
+            # Read the attendance for all calendars
+            for i in self.generator.getData(
+                "resource.calendar.attendance",
+                fields=[
+                    "dayofweek",
+                    "date_from",
+                    "date_to",
+                    "hour_from",
+                    "hour_to",
+                    "calendar_id",
+                ],
+            ):
+                if i["calendar_id"] and i["calendar_id"][0] in cal_ids:
+                    if i["calendar_id"][1] not in calendars:
+                        calendars[i["calendar_id"][1]] = []
+                    i["attendance"] = True
+                    calendars[i["calendar_id"][1]].append(i)
+            # Read the leaves for all calendars
+            for i in self.generator.getData(
+                "resource.calendar.leaves",
+                search=[("time_type", "=", "leave")],
+                fields=[
+                    "date_from",
+                    "date_to",
+                    "calendar_id",
+                ],
+            ):
+                logger.info("Entering loop 1")
+                if i["calendar_id"] and i["calendar_id"][0] in cal_ids:
+                    if i["calendar_id"][1] not in calendars:
+                        calendars[i["calendar_id"][1]] = []
+                    i["attendance"] = False
+                    calendars[i["calendar_id"][1]].append(i)
+
+            # Iterate over the results:
+            for i in calendars:
+                priority_attendance = 1000
+                priority_leave = 10
+                if cal_tz[i] != self.timezone:
+                    logger.warning(
+                        "timezone is different on workcenter %s and connector user. Working hours will not be synced correctly to frepple."
+                        % i
                     )
-                )
-            if len(buckets) > 0:
-                # Sort by start date.
-                # Required to assure that records with a later start date get a
-                # lower priority in frePPLe.
-                buckets.sort(key=itemgetter(0))
-                priority = 1000
-                yield '<calendar name=%s default="0"><buckets>\n' % quoteattr(
-                    self.calendar
-                )
-                for i in buckets:
-                    yield i[1] % priority
-                    priority -= 1
-            else:
-                # No entries. We'll assume 24*7 availability.
-                yield '<calendar name=%s default="1"><buckets>\n' % quoteattr(
-                    self.calendar
-                )
-        except Exception:
-            # Exception happens if the resource module isn't installed.
-            yield "<!-- Working hours are assumed to be 24*7. -->\n"
-            yield '<calendar name=%s default="1"><buckets>\n' % quoteattr(self.calendar)
-        try:
-            m = self.env["hr.holidays.public.line"]
-            recs = m.search([])
-            fields = ["date"]
-            for i in recs.read(fields):
-                nd = datetime.strptime(i["date"], "%Y-%m-%d") + timedelta(days=1)
-                yield '<bucket start="%sT00:00:00" end="%sT00:00:00" value="0" priority="1"/>\n' % (
-                    i["date"],
-                    nd.strftime("%Y-%m-%d"),
-                )
-        except Exception:
-            # Exception happens if the hr module is not installed
-            yield "<!-- No holidays since the HR module is not installed -->\n"
-        yield "</buckets></calendar></calendars>\n"
+                yield '<calendar name=%s default="0"><buckets>\n' % quoteattr(i)
+                for j in calendars[i]:
+                    yield '<bucket start="%s" end="%s" value="%s" days="%s" priority="%s" starttime="%s" endtime="%s"/>\n' % (
+                        self.formatDateTime(j["date_from"], cal_tz[i])
+                        if not j["attendance"]
+                        else (
+                            j["date_from"].strftime("%Y-%m-%dT00:00:00")
+                            if j["date_from"]
+                            else "2000-01-01T00:00:00"
+                        ),
+                        self.formatDateTime(j["date_to"], cal_tz[i])
+                        if not j["attendance"]
+                        else (
+                            j["date_to"].strftime("%Y-%m-%dT00:00:00")
+                            if j["date_to"]
+                            else "2030-01-01T00:00:00"
+                        ),
+                        "1" if j["attendance"] else "0",
+                        (2 ** ((int(j["dayofweek"]) + 1) % 7))
+                        if "dayofweek" in j
+                        else (2 ** 7) - 1,
+                        priority_attendance if j["attendance"] else priority_leave,
+                        # In odoo, monday = 0. In frePPLe, sunday = 0.
+                        ("PT%dM" % round(j["hour_from"] * 60))
+                        if "hour_from" in j
+                        else "PT0M",
+                        ("PT%dM" % round(j["hour_to"] * 60))
+                        if "hour_to" in j
+                        else "PT1440M",
+                    )
+                    if j["attendance"]:
+                        priority_attendance += 1
+                    else:
+                        priority_leave += 1
+                yield "</buckets></calendar>\n"
+
+            yield "</calendars>\n"
+        except Exception as e:
+            logger.info(e)
+            yield "</calendars>\n"
 
     def export_locations(self):
         """
@@ -330,65 +515,52 @@ class exporter(object):
         stock.warehouse.id -> location.subcategory
         """
         self.map_locations = {}
-        self.warehouses = set()
-        childlocs = {}
-        m = self.env["stock.warehouse"]
-        recs = m.search([])
-        if recs:
-            yield "<!-- warehouses -->\n"
-            yield "<locations>\n"
-            fields = [
-                "name",
-                "lot_stock_id",
-                "wh_input_stock_loc_id",
-                "wh_output_stock_loc_id",
-                "wh_pack_stock_loc_id",
-                "wh_qc_stock_loc_id",
-                "view_location_id",
-            ]
-            for i in recs.read(fields):
+        self.warehouses = {}
+        first = True
+        for i in self.generator.getData(
+            "stock.warehouse",
+            fields=["name"],
+        ):
+            if first:
+                yield "<!-- warehouses -->\n"
+                yield "<locations>\n"
+                first = False
+            if self.calendar:
                 yield '<location name=%s subcategory="%s"><available name=%s/></location>\n' % (
                     quoteattr(i["name"]),
                     i["id"],
                     quoteattr(self.calendar),
                 )
-                childlocs[i["lot_stock_id"][0]] = i["name"]
-                childlocs[i["wh_input_stock_loc_id"][0]] = i["name"]
-                childlocs[i["wh_output_stock_loc_id"][0]] = i["name"]
-                childlocs[i["wh_pack_stock_loc_id"][0]] = i["name"]
-                childlocs[i["wh_qc_stock_loc_id"][0]] = i["name"]
-                childlocs[i["view_location_id"][0]] = i["name"]
-                # also add warehouse id for future lookups
-                childlocs[i["id"]] = i["name"]
-
-                self.warehouses.add(i["name"])
+            else:
+                yield '<location name=%s subcategory="%s"></location>\n' % (
+                    quoteattr(i["name"]),
+                    i["id"],
+                )
+            self.warehouses[i["id"]] = i["name"]
+        if not first:
             yield "</locations>\n"
 
-            # Populate a mapping location-to-warehouse name for later lookups
-            parent_loc = {}
-            m = self.env["stock.location"]
-            recs = m.search([])
-            for i in recs.read(["location_id"]):
-                if i["location_id"]:
-                    parent_loc[i["id"]] = i["location_id"][0]
+        # Populate a mapping location-to-warehouse name for later lookups
+        loc_ids = [
+            loc["id"]
+            for loc in self.generator.getData(
+                "stock.location",
+                search=[("usage", "=", "internal")],
+                fields=["id"],
+            )
+        ]
 
-            marked = {}
-
-            def fnd_parent(loc_id):  # go up the parent chain to find the warehouse
-                if not marked.get(loc_id):  # ensures O(N) iterations instead of O(N^2)
-                    if childlocs.get(loc_id):
-                        return childlocs[loc_id]
-                    if parent_loc.get(loc_id):
-                        parent = fnd_parent(parent_loc[loc_id])
-                        if parent:
-                            return parent
-                marked[loc_id] = True
-                return -1
-
-            for loc_id in recs:
-                parent = fnd_parent(loc_id["id"])
-                if parent:
-                    self.map_locations[loc_id["id"]] = parent
+        for loc_object in self.generator.getData(
+            "stock.location",
+            ids=loc_ids,
+        ):
+            if (
+                loc_object.get("warehouse_id", False)
+                and loc_object["warehouse_id"][0] in self.warehouses
+            ):
+                self.map_locations[loc_object["id"]] = self.warehouses[
+                    loc_object["warehouse_id"][0]
+                ]
 
     def export_customers(self):
         """
@@ -399,16 +571,20 @@ class exporter(object):
         res.partner.id res.partner.name -> customer.name
         """
         self.map_customers = {}
-        m = self.env["res.partner"]
-        recs = m.search([("customer", "=", True)])
-        if recs:
-            yield "<!-- customers -->\n"
-            yield "<customers>\n"
-            fields = ["name"]
-            for i in recs.read(fields):
-                name = "%d %s" % (i["id"], i["name"])
-                yield "<customer name=%s/>\n" % quoteattr(name)
-                self.map_customers[i["id"]] = name
+        first = True
+        for i in self.generator.getData(
+            "res.partner",
+            search=[("is_company", "=", True)],
+            fields=["name"],
+        ):
+            if first:
+                yield "<!-- customers -->\n"
+                yield "<customers>\n"
+                first = False
+            name = "%s %s" % (i["name"], i["id"])
+            yield "<customer name=%s/>\n" % quoteattr(name)
+            self.map_customers[i["id"]] = name
+        if not first:
             yield "</customers>\n"
 
     def export_suppliers(self):
@@ -419,17 +595,57 @@ class exporter(object):
         Mapping:
         res.partner.id res.partner.name -> supplier.name
         """
-        m = self.env["res.partner"]
-        recs = m.search([("supplier", "=", True)])
-        if recs:
-            yield "<!-- suppliers -->\n"
-            yield "<suppliers>\n"
-            fields = ["name"]
-            for i in recs.read(fields):
-                yield "<supplier name=%s/>\n" % quoteattr(
-                    "%d %s" % (i["id"], i["name"])
-                )
+        first = True
+        for i in self.generator.getData(
+            "res.partner",
+            search=[("is_company", "=", True)],
+            fields=["name"],
+        ):
+            if first:
+                yield "<!-- suppliers -->\n"
+                yield "<suppliers>\n"
+                first = False
+            yield "<supplier name=%s/>\n" % quoteattr("%d %s" % (i["id"], i["name"]))
+        if not first:
             yield "</suppliers>\n"
+
+    def export_skills(self):
+        first = True
+        for i in self.generator.getData(
+            "mrp.skill",
+            fields=["name"],
+        ):
+            if first:
+                yield "<!-- skills -->\n"
+                yield "<skills>\n"
+                first = False
+            name = i["name"]
+            yield "<skill name=%s/>\n" % (quoteattr(name),)
+        if not first:
+            yield "</skills>\n"
+
+    def export_workcenterskills(self):
+        first = True
+        for i in self.generator.getData(
+            "mrp.workcenter.skill",
+            fields=["workcenter", "skill", "priority"],
+        ):
+            if not i["workcenter"] or i["workcenter"][0] not in self.map_workcenters:
+                continue
+            if first:
+                yield "<!-- resourceskills -->\n"
+                yield "<skills>\n"
+                first = False
+            yield "<skill name=%s>\n" % quoteattr(i["skill"][1])
+            yield "<resourceskills>"
+            yield '<resourceskill priority="%d"><resource name=%s/></resourceskill>' % (
+                i["priority"],
+                quoteattr(self.map_workcenters[i["workcenter"][0]]),
+            )
+            yield "</resourceskills>"
+            yield "</skill>"
+        if not first:
+            yield "</skills>"
 
     def export_workcenters(self):
         """
@@ -439,25 +655,42 @@ class exporter(object):
 
         Mapping:
         mrp.workcenter.name -> resource.name
-        mrp.workcenter.costs_hour -> resource.cost
-        mrp.workcenter.capacity_per_cycle / mrp.workcenter.time_cycle -> resource.maximum
+        mrp.workcenter.owner -> resource.owner
+        mrp.workcenter.resource_calendar_id -> resource.available
+        mrp.workcenter.capacity -> resource.maximum
+        mrp.workcenter.time_efficiency -> resource.efficiency
+
         company.mfg_location -> resource.location
         """
         self.map_workcenters = {}
-        m = self.env["mrp.workcenter"]
-        recs = m.search([])
-        fields = ["name"]
-        if recs:
-            yield "<!-- workcenters -->\n"
-            yield "<resources>\n"
-            for i in recs.read(fields):
-                name = i["name"]
-                self.map_workcenters[i["id"]] = name
-                yield '<resource name=%s maximum="%s"><location name=%s/></resource>\n' % (
-                    quoteattr(name),
-                    1,
-                    quoteattr(self.mfg_location),
-                )
+        first = True
+        for i in self.generator.getData(
+            "mrp.workcenter",
+            fields=[
+                "name",
+                "owner",
+                "resource_calendar_id",
+                "time_efficiency",
+                "capacity",
+            ],
+        ):
+            if first:
+                yield "<!-- workcenters -->\n"
+                yield "<resources>\n"
+                first = False
+            name = i["name"]
+            owner = i["owner"]
+            available = i["resource_calendar_id"]
+            self.map_workcenters[i["id"]] = name
+            yield '<resource name=%s maximum="%s" efficiency="%s"><location name=%s/>%s%s</resource>\n' % (
+                quoteattr(name),
+                i["capacity"],
+                i["time_efficiency"],
+                quoteattr(self.mfg_location),
+                ("<owner name=%s/>" % quoteattr(owner[1])) if owner else "",
+                ("<available name=%s/>" % quoteattr(available[1])) if available else "",
+            )
+        if not first:
             yield "</resources>\n"
 
     def export_items(self):
@@ -480,158 +713,160 @@ class exporter(object):
         supplierinfo.date_start -> itemsupplier.effective_start
         supplierinfo.date_end -> itemsupplier.effective_end
         product.product.product_tmpl_id.delay -> itemsupplier.leadtime
-        '1' -> itemsupplier.priority
+        supplierinfo.sequence -> itemsupplier.priority
         """
+
+        # Read the product categories
+        self.category_parent = {}
+        for i in self.generator.getData(
+            "product.category",
+            fields=["name", "parent_id"],
+        ):
+            if i["parent_id"]:
+                self.category_parent[i["name"]] = i["parent_id"]
+
         # Read the product templates
         self.product_product = {}
         self.product_template_product = {}
-        self.category_parent = {}
-
-        m = self.env["product.category"]
-        fields = ["name", "parent_id"]
-        recs = m.search([])
-        for i in recs.read(fields):
-            if i["parent_id"]:
-                self.category_parent[i["name"]] = i["parent_id"]
-        m = self.env["product.template"]
-        fields = [
-            "purchase_ok",
-            "route_ids",
-            "bom_ids",
-            "produce_delay",
-            "list_price",
-            "uom_id",
-            "seller_ids",
-            "standard_price",
-            "categ_id",
-        ]
         self.product_templates = {}
-        offset = 0
-        pagesize = 1000
-        while True:
-            recs = m.search([("type", "!=", "service")], limit=pagesize, offset=offset)
-            if not recs:
-                break
-            for i in recs.read(fields):
-                self.product_templates[i["id"]] = i
-            offset += pagesize
-
-        # Read the stock location routes
-        rts = self.env["stock.location.route"]
-        fields = ["name"]
-        recs = rts.search([])
-        stock_location_routes = {}
-        for i in recs.read(fields):
-            stock_location_routes[i["id"]] = i
+        for i in self.generator.getData(
+            "product.template",
+            search=[("type", "!=", "service")],
+            fields=[
+                "purchase_ok",
+                "produce_delay",
+                "list_price",
+                "uom_id",
+                "categ_id",
+                "minimum_stock_level",
+            ],
+        ):
+            self.product_templates[i["id"]] = i
 
         # Read the products
-        m = self.env["product.product"]
-        recs = m.search([])
-        s = self.env["product.supplierinfo"]
-        s_fields = [
-            "product_tmpl_id",
+        supplierinfo_fields = [
             "name",
             "delay",
             "min_qty",
             "date_end",
             "date_start",
             "price",
+            "batching_window",
+            "sequence",
+            "is_subcontractor",
         ]
-        s_recs = s.search([])
-        self.product_supplier = {}
-        for s in s_recs.read(s_fields):
-            if s["product_tmpl_id"][0] in self.product_supplier:
-                self.product_supplier[s["product_tmpl_id"][0]].append(
-                    (
-                        s["name"],
-                        s["delay"],
-                        s["min_qty"],
-                        s["date_end"],
-                        s["date_start"],
-                        s["price"],
+        first = True
+        for i in self.generator.getData(
+            "product.product",
+            fields=[
+                "id",
+                "name",
+                "code",
+                "product_tmpl_id",
+                "volume",
+                "weight",
+            ],
+        ):
+            if first:
+                yield "<!-- products -->\n"
+                yield "<items>\n"
+                first = False
+            if i["product_tmpl_id"][0] not in self.product_templates:
+                continue
+            tmpl = self.product_templates[i["product_tmpl_id"][0]]
+            if i["code"]:
+                name = ("[%s] %s" % (i["code"], i["name"]))[:300]
+            else:
+                name = i["name"][:300]
+            prod_obj = {"name": name, "template": i["product_tmpl_id"][0]}
+            self.product_product[i["id"]] = prod_obj
+            self.product_template_product[i["product_tmpl_id"][0]] = prod_obj
+            # For make-to-order items the next line needs to XML snippet ' type="item_mto"'.
+            yield '<item name=%s uom=%s volume="%f" weight="%f" cost="%f" category=%s subcategory="%s,%s">\n' % (
+                quoteattr(name),
+                quoteattr(tmpl["uom_id"][1]) if tmpl["uom_id"] else "",
+                i["volume"] or 0,
+                i["weight"] or 0,
+                max(0, tmpl["list_price"] or 0)
+                / self.convert_qty_uom(1.0, tmpl["uom_id"], i["product_tmpl_id"][0]),
+                quoteattr(
+                    "%s%s"
+                    % (
+                        ("%s/" % self.category_parent(tmpl["categ_id"][1]))
+                        if tmpl["categ_id"][1] in self.category_parent
+                        else "",
+                        tmpl["categ_id"][1],
                     )
                 )
-            else:
-                self.product_supplier[s["product_tmpl_id"][0]] = [
-                    (
-                        s["name"],
-                        s["delay"],
-                        s["min_qty"],
-                        s["date_end"],
-                        s["date_start"],
-                        s["price"],
-                    )
-                ]
-        if recs:
-            yield "<!-- products -->\n"
-            yield "<items>\n"
-            fields = ["id", "name", "code", "product_tmpl_id", "seller_ids"]
-            for i in recs.read(fields):
-                yielded_header = False
+                if tmpl["categ_id"]
+                else '""',
+                self.uom_categories[self.uom[tmpl["uom_id"][0]]["category"]],
+                i["id"],
+            )
+            # Export suppliers for the item, if the item is allowed to be purchased
+            if tmpl["purchase_ok"]:
+                exists = False
                 try:
-                    tmpl = self.product_templates[i["product_tmpl_id"][0]]
-                    if i["code"]:
-                        name = u"[%s] %s" % (i["code"], i["name"])
-                    else:
-                        name = i["name"]
-                    prod_obj = {"name": name, "template": i["product_tmpl_id"][0]}
-                    self.product_product[i["id"]] = prod_obj
-                    self.product_template_product[i["product_tmpl_id"][0]] = prod_obj
-                    yield '<item name=%s cost="%f" category=%s subcategory="%s,%s">\n' % (
-                        quoteattr(name),
-                        (tmpl["list_price"] or 0)
-                        / self.convert_qty_uom(
-                            1.0, tmpl["uom_id"][0], i["product_tmpl_id"][0]
-                        ),
-                        quoteattr(
-                            "%s%s"
-                            % (
-                                ("%s/" % self.category_parent(tmpl["categ_id"][1]))
-                                if tmpl["categ_id"][1] in self.category_parent
-                                else "",
-                                tmpl["categ_id"][1],
-                            )
-                        ),
-                        self.uom_categories[self.uom[tmpl["uom_id"][0]]["category"]],
-                        i["id"],
+                    # TODO it's inefficient to run a query per product template.
+                    results = self.generator.getData(
+                        "product.supplierinfo",
+                        search=[("product_tmpl_id", "=", tmpl["id"])],
+                        fields=supplierinfo_fields,
                     )
-                    yielded_header = True
-                    # Export suppliers for the item, if the item is allowed to be purchased
-                    if (
-                        tmpl["purchase_ok"]
-                        and i["product_tmpl_id"][0] in self.product_supplier
-                    ):
+                except:
+                    # subcontracting module not installed
+                    supplierinfo_fields.remove("is_subcontractor")
+                    results = self.generator.getData(
+                        "product.supplierinfo",
+                        search=[("product_tmpl_id", "=", tmpl["id"])],
+                        fields=supplierinfo_fields,
+                    )
+                suppliers = set()
+                for sup in results:
+                    if not exists:
+                        exists = True
                         yield "<itemsuppliers>\n"
-                        for sup in self.product_supplier[i["product_tmpl_id"][0]]:
-                            try:
-                                name = "%d %s" % (sup[0][0], sup[0][1])
-                                yield '<itemsupplier leadtime="P%dD" priority="1" size_minimum="%f" cost="%f"%s%s><supplier name=%s/></itemsupplier>\n' % (
-                                    sup[1],
-                                    sup[2],
-                                    sup[5],
-                                    ' effective_end="%sT00:00:00"'
-                                    % sup[3].strftime("%Y-%m-%d")
-                                    if sup[3]
-                                    else "",
-                                    ' effective_start="%sT00:00:00"'
-                                    % sup[4].strftime("%Y-%m-%d")
-                                    if sup[4]
-                                    else "",
-                                    quoteattr(name),
-                                )
-                            except Exception as e:
-                                logger.error(
-                                    "Error exporting suppliers for product %s: %s"
-                                    % (i.get("id", None), e)
-                                )
-                        yield "</itemsuppliers>\n"
-                    yield "</item>\n"
-                except Exception as e:
-                    logger.error(
-                        "Error exporting product %s: %s" % (i.get("id", None), e)
-                    )
-                    if yielded_header:
-                        yield "</item>\n"
+                    name = "%d %s" % (sup["name"][0], sup["name"][1])
+                    if (
+                        name in suppliers
+                        and not sup["date_end"]
+                        and not sup["date_start"]
+                    ):
+                        # Avoid multiple records for the same supplier (unless there is date effecitivity). Keep only the first.
+                        continue
+                    suppliers.add(name)
+                    if sup.get("is_subcontractor", False):
+                        if not hasattr(tmpl, "subcontractors"):
+                            tmpl["subcontractors"] = []
+                        tmpl["subcontractors"].append(
+                            {
+                                "name": name,
+                                "delay": sup["delay"],
+                                "priority": sup["sequence"] or 1,
+                                "size_minimum": sup["min_qty"],
+                            }
+                        )
+                    else:
+                        yield '<itemsupplier leadtime="P%dD" priority="%s" batchwindow="P%dD" size_minimum="%f" cost="%f"%s%s><supplier name=%s/></itemsupplier>\n' % (
+                            sup["delay"],
+                            sup["sequence"] or 1,
+                            sup["batching_window"] or 0,
+                            sup["min_qty"],
+                            max(0, sup["price"]),
+                            ' effective_end="%sT00:00:00"'
+                            % sup["date_end"].strftime("%Y-%m-%d")
+                            if sup["date_end"]
+                            else "",
+                            ' effective_start="%sT00:00:00"'
+                            % sup["date_start"].strftime("%Y-%m-%d")
+                            if sup["date_start"]
+                            else "",
+                            quoteattr(name),
+                        )
+                if exists:
+                    yield "</itemsuppliers>\n"
+            yield "</item>\n"
+        if not first:
             yield "</items>\n"
 
     def export_boms(self):
@@ -651,288 +886,352 @@ class exporter(object):
         self.bom_producedQty = {}
 
         # Read all active manufacturing routings
-        m = self.env["mrp.routing"]
-        recs = m.search([])
-        fields = ["location_id"]
-        mrp_routings = {}
-        for i in recs.read(fields):
-            mrp_routings[i["id"]] = i["location_id"]
+        # mrp_routings = {}
+        # m = self.env["mrp.routing"]
+        # recs = m.search([])
+        # fields = ["location_id"]
+        # for i in recs.read(fields):
+        #    mrp_routings[i["id"]] = i["location_id"]
 
         # Read all workcenters of all routings
         mrp_routing_workcenters = {}
-        m = self.env["mrp.routing.workcenter"]
-        recs = m.search([], order="routing_id, sequence asc")
-        fields = ["name", "routing_id", "workcenter_id", "sequence", "time_cycle"]
-        for i in recs.read(fields):
-            if i["routing_id"][0] in mrp_routing_workcenters:
+        for i in self.generator.getData(
+            "mrp.routing.workcenter",
+            order="bom_id, sequence, id asc",
+            fields=[
+                "name",
+                "bom_id",
+                "workcenter_id",
+                "sequence",
+                "time_cycle",
+                "skill",
+                "search_mode",
+            ],
+        ):
+            if not i["bom_id"]:
+                continue
+
+            if i["bom_id"][0] in mrp_routing_workcenters:
                 # If the same workcenter is used multiple times in a routing,
                 # we add the times together.
                 exists = False
                 if not self.manage_work_orders:
-                    for r in mrp_routing_workcenters[i["routing_id"][0]]:
-                        if r[0] == i["workcenter_id"][1]:
-                            r[1] += i["time_cycle"]
+                    for r in mrp_routing_workcenters[i["bom_id"][0]]:
+                        if r["workcenter_id"][1] == i["workcenter_id"][1]:
+                            r["time_cycle"] += i["time_cycle"]
                             exists = True
                             break
                 if not exists:
-                    mrp_routing_workcenters[i["routing_id"][0]].append(
-                        [
-                            i["workcenter_id"][1],
-                            i["time_cycle"],
-                            i["sequence"],
-                            i["name"],
-                        ]
-                    )
+                    mrp_routing_workcenters[i["bom_id"][0]].append(i)
             else:
-                mrp_routing_workcenters[i["routing_id"][0]] = [
-                    [i["workcenter_id"][1], i["time_cycle"], i["sequence"], i["name"]]
-                ]
-
-        # Models used in the bom-loop below
-        bom_lines_model = self.env["mrp.bom.line"]
-        bom_lines_fields = ["product_qty", "product_uom_id", "product_id", "routing_id"]
-        try:
-            subproduct_model = self.env["mrp.subproduct"]
-            subproduct_fields = [
-                "product_id",
-                "product_qty",
-                "product_uom",
-                "subproduct_type",
-            ]
-        except Exception:
-            subproduct_model = None
+                mrp_routing_workcenters[i["bom_id"][0]] = [i]
 
         # Loop over all bom records
-        bom_recs = self.env["mrp.bom"].search([])
-        bom_fields = [
-            "product_qty",
-            "product_uom_id",
-            "product_tmpl_id",
-            "routing_id",
-            "type",
-            "bom_line_ids",
-            "sub_products",
-        ]
-        for i in bom_recs.read(bom_fields):
+        for i in self.generator.getData(
+            "mrp.bom",
+            fields=[
+                "product_qty",
+                "product_uom_id",
+                "product_tmpl_id",
+                "type",
+                "bom_line_ids",
+                "sequence",
+            ],
+        ):
             # Determine the location
-            if i["routing_id"]:
-                location = mrp_routings.get(i["routing_id"][0], None)
-                if not location:
-                    location = self.mfg_location
-                else:
-                    location = location[1]
-            else:
-                location = self.mfg_location
+            location = self.mfg_location
 
             # Determine operation name and item
             product_buf = self.product_template_product.get(
                 i["product_tmpl_id"][0], None
             )  # TODO avoid multiple bom on single template
             if not product_buf:
-                logger.warning(
-                    "skipping %s %s" % (i["product_tmpl_id"][0], i["routing_id"])
-                )
+                logger.warning("Skipping %s" % i["product_tmpl_id"][0])
                 continue
             uom_factor = self.convert_qty_uom(
-                1.0, i["product_uom_id"][0], i["product_tmpl_id"][0]
+                1.0, i["product_uom_id"], i["product_tmpl_id"][0]
             )
-            operation = u"%d %s @ %s" % (i["id"], product_buf["name"], location)
-            self.operations.add(operation)
 
-            # Build operation. The operation can either be a summary operation or a detailed
-            # routing.
-            if (
-                not self.manage_work_orders
-                or not i["routing_id"]
-                or not mrp_routing_workcenters.get(i["routing_id"][0], [])
-            ):
-                #
-                # CASE 1: A single operation used for the BOM
-                # All routing steps are collapsed in a single operation.
-                #
-                yield '<operation name=%s size_multiple="1" duration="%s" posttime="P%dD" xsi:type="operation_fixed_time">\n' "<item name=%s/><location name=%s/>\n" % (
-                    quoteattr(operation),
-                    self.convert_float_time(
-                        self.product_templates[i["product_tmpl_id"][0]]["produce_delay"]
-                    ),
-                    self.manufacturing_lead,
-                    quoteattr(product_buf["name"]),
-                    quoteattr(location),
+            # Loop over all subcontractors
+            if i["type"] == "subcontract":
+                subcontractors = self.product_templates[i["product_tmpl_id"][0]].get(
+                    "subcontractors", None
                 )
-                convertedQty = self.convert_qty_uom(
-                    i["product_qty"], i["product_uom_id"][0], i["product_tmpl_id"][0]
+                if not subcontractors:
+                    continue
+            else:
+                subcontractors = [{}]
+            for subcontractor in subcontractors:
+                # Build operation. The operation can either be a summary operation or a detailed
+                # routing.
+                operation = "%s @ %s %d" % (
+                    product_buf["name"],
+                    subcontractor.get("name", location),
+                    i["id"],
                 )
-                yield '<flows>\n<flow xsi:type="flow_end" quantity="%f"><item name=%s/></flow>\n' % (
-                    convertedQty,
-                    quoteattr(product_buf["name"]),
-                )
-                self.bom_producedQty[(operation, product_buf["name"])] = convertedQty
-
-                # Build consuming flows.
-                # If the same component is consumed multiple times in the same BOM
-                # we sum up all quantities in a single flow. We assume all of them
-                # have the same effectivity.
-                fl = {}
-                for j in bom_lines_model.browse(i["bom_line_ids"]).read(
-                    bom_lines_fields
+                if len(operation) > 300:
+                    suffix = " @ %s %d" % (
+                        subcontractor.get("name", location),
+                        i["id"],
+                    )
+                    operation = "%s%s" % (
+                        product_buf["name"][: 300 - len(suffix)],
+                        suffix,
+                    )
+                self.operations.add(operation)
+                if (
+                    not self.manage_work_orders
+                    or subcontractor
+                    or not mrp_routing_workcenters.get(i["id"], [])
                 ):
-                    product = self.product_product.get(j["product_id"][0], None)
-                    if not product:
-                        continue
-                    if j["product_id"][0] in fl:
-                        fl[j["product_id"][0]].append(j)
-                    else:
-                        fl[j["product_id"][0]] = [j]
-                for j in fl:
-                    product = self.product_product[j]
-                    qty = sum(
-                        self.convert_qty_uom(
-                            k["product_qty"],
-                            k["product_uom_id"][0],
-                            self.product_product[k["product_id"][0]]["template"],
+                    #
+                    # CASE 1: A single operation used for the BOM
+                    # All routing steps are collapsed in a single operation.
+                    #
+                    if subcontractor:
+                        yield '<operation name=%s size_multiple="1" category="subcontractor" subcategory=%s duration="P%dD" posttime="P%dD" xsi:type="operation_fixed_time" priority="%s" size_minimum="%s">\n' "<item name=%s/><location name=%s/>\n" % (
+                            quoteattr(operation),
+                            quoteattr(subcontractor["name"]),
+                            subcontractor.get("delay", 0),
+                            self.po_lead,
+                            subcontractor.get("priority", 1),
+                            subcontractor.get("size_minimum", 0),
+                            quoteattr(product_buf["name"]),
+                            quoteattr(location),
                         )
-                        for k in fl[j]
-                    )
-                    yield '<flow xsi:type="flow_start" quantity="-%f"><item name=%s/></flow>\n' % (
-                        qty,
-                        quoteattr(product["name"]),
-                    )
+                    else:
+                        duration_per = (
+                            self.product_templates[i["product_tmpl_id"][0]][
+                                "produce_delay"
+                            ]
+                            / 1440.0
+                        )
+                        yield '<operation name=%s size_multiple="1" duration_per="%s" posttime="P%dD" priority="%s" xsi:type="operation_time_per">\n' "<item name=%s/><location name=%s/>\n" % (
+                            quoteattr(operation),
+                            self.convert_float_time(duration_per)
+                            if duration_per and duration_per > 0
+                            else "P0D",
+                            self.manufacturing_lead,
+                            i["sequence"] or 1,
+                            quoteattr(product_buf["name"]),
+                            quoteattr(location),
+                        )
 
-                # Build byproduct flows
-                if i.get("sub_products", None) and subproduct_model:
-                    for j in subproduct_model.browse(i["sub_products"]).read(
-                        subproduct_fields
+                    convertedQty = self.convert_qty_uom(
+                        i["product_qty"],
+                        i["product_uom_id"],
+                        i["product_tmpl_id"][0],
+                    )
+                    yield '<flows>\n<flow xsi:type="flow_end" quantity="%f"><item name=%s/></flow>\n' % (
+                        convertedQty,
+                        quoteattr(product_buf["name"]),
+                    )
+                    self.bom_producedQty[
+                        (operation, product_buf["name"])
+                    ] = convertedQty
+
+                    # Build consuming flows.
+                    # If the same component is consumed multiple times in the same BOM
+                    # we sum up all quantities in a single flow. We assume all of them
+                    # have the same effectivity.
+                    fl = {}
+                    for j in self.generator.getData(
+                        "mrp.bom.line",
+                        ids=i["bom_line_ids"],
+                        fields=[
+                            "product_qty",
+                            "product_uom_id",
+                            "product_id",
+                            "operation_id",
+                        ],
                     ):
                         product = self.product_product.get(j["product_id"][0], None)
                         if not product:
                             continue
-                        yield '<flow xsi:type="%s" quantity="%f"><item name=%s/></flow>\n' % (
-                            "flow_fixed_end"
-                            if j["subproduct_type"] == "fixed"
-                            else "flow_end",
+                        if j["product_id"][0] in fl:
+                            fl[j["product_id"][0]].append(j)
+                        else:
+                            fl[j["product_id"][0]] = [j]
+                    for j in fl:
+                        product = self.product_product[j]
+                        qty = sum(
                             self.convert_qty_uom(
-                                j["product_qty"],
-                                j["product_uom"][0],
-                                j["product_id"][0],
-                            ),
-                            quoteattr(product["name"]),
-                        )
-                yield "</flows>\n"
-
-                # Create loads
-                if i["routing_id"]:
-                    yield "<loads>\n"
-                    for j in mrp_routing_workcenters.get(i["routing_id"][0], []):
-                        yield '<load quantity="%f"><resource name=%s/></load>\n' % (
-                            j[1],
-                            quoteattr(j[0]),
-                        )
-                    yield "</loads>\n"
-            else:
-                #
-                # CASE 2: A routing operation is created with a suboperation for each
-                # routing step.
-                #
-                yield '<operation name=%s size_multiple="1" posttime="P%dD" xsi:type="operation_routing">' "<item name=%s/><location name=%s/>\n" % (
-                    quoteattr(operation),
-                    self.manufacturing_lead,
-                    quoteattr(product_buf["name"]),
-                    quoteattr(location),
-                )
-
-                yield "<suboperations>"
-                steplist = mrp_routing_workcenters[i["routing_id"][0]]
-                # sequence cannot be trusted in odoo12
-                counter = 0
-                for step in steplist:
-                    counter = counter + 1
-                    suboperation = step[3]
-                    yield "<suboperation>" '<operation name=%s priority="%s" duration="%s" xsi:type="operation_fixed_time">\n' "<location name=%s/>\n" '<loads><load quantity="%f"><resource name=%s/></load></loads>\n' % (
-                        quoteattr(
-                            "%s - %s - %s" % (operation, suboperation, (counter * 100))
-                        ),
-                        counter * 10,
-                        self.convert_float_time(step[1]),
-                        quoteattr(location),
-                        1,
-                        quoteattr(step[0]),
-                    )
-                    if step[2] == steplist[-1][2]:
-                        # Add producing flows on the last routing step
-                        yield '<flows>\n<flow xsi:type="flow_end" quantity="%f"><item name=%s/></flow>\n' % (
-                            i["product_qty"]
-                            * getattr(i, "product_efficiency", 1.0)
-                            * uom_factor,
-                            quoteattr(product_buf["name"]),
-                        )
-                        self.bom_producedQty[
-                            ("%s - %s" % (operation, step[2]), product_buf["name"])
-                        ] = (
-                            i["product_qty"]
-                            * getattr(i, "product_efficiency", 1.0)
-                            * uom_factor
-                        )
-                        # Add byproduct flows
-                        if i.get("sub_products", None):
-                            for j in subproduct_model.browse(i["sub_products"]).read(
-                                subproduct_fields
-                            ):
-                                product = self.product_product.get(
-                                    j["product_id"][0], None
-                                )
-                                if not product:
-                                    continue
-                                yield '<flow xsi:type="%s" quantity="%f"><item name=%s/></flow>\n' % (
-                                    "flow_fixed_end"
-                                    if j["subproduct_type"] == "fixed"
-                                    else "flow_end",
-                                    self.convert_qty_uom(
-                                        j["product_qty"],
-                                        j["product_uom"][0],
-                                        self.product_product[j["product_id"][0]][
-                                            "template"
-                                        ],
-                                    ),
-                                    quoteattr(product["name"]),
-                                )
-                        yield "</flows>\n"
-                    if step[2] == steplist[0][2]:
-                        # All consuming flows on the first routing step.
-                        # If the same component is consumed multiple times in the same BOM
-                        # we sum up all quantities in a single flow. We assume all of them
-                        # have the same effectivity.
-                        fl = {}
-                        for j in bom_lines_model.browse(i["bom_line_ids"]).read(
-                            bom_lines_fields
-                        ):
-                            product = self.product_product.get(j["product_id"][0], None)
-                            if not product:
-                                continue
-                            if j["product_id"][0] in fl:
-                                fl[j["product_id"][0]].append(j)
-                            else:
-                                fl[j["product_id"][0]] = [j]
-                        yield "<flows>\n"
-                        for j in fl:
-                            product = self.product_product[j]
-                            qty = sum(
-                                self.convert_qty_uom(
-                                    k["product_qty"],
-                                    k["product_uom_id"][0],
-                                    self.product_product[k["product_id"][0]][
-                                        "template"
-                                    ],
-                                )
-                                for k in fl[j]
+                                k["product_qty"],
+                                k["product_uom_id"],
+                                self.product_product[k["product_id"][0]]["template"],
                             )
+                            for k in fl[j]
+                        )
+                        if qty > 0:
                             yield '<flow xsi:type="flow_start" quantity="-%f"><item name=%s/></flow>\n' % (
                                 qty,
                                 quoteattr(product["name"]),
                             )
-                        yield "</flows>\n"
-                    yield "</operation></suboperation>\n"
-                yield "</suboperations>\n"
-            yield "</operation>\n"
+
+                    # Build byproduct flows
+                    if i.get("sub_products", None):
+                        for j in self.generator.getData(
+                            "mrp.subproduct",
+                            ids=i["sub_products"],
+                            fields=[
+                                "product_id",
+                                "product_qty",
+                                "product_uom",
+                                "subproduct_type",
+                            ],
+                        ):
+                            product = self.product_product.get(j["product_id"][0], None)
+                            if not product:
+                                continue
+                            yield '<flow xsi:type="%s" quantity="%f"><item name=%s/></flow>\n' % (
+                                "flow_fixed_end"
+                                if j["subproduct_type"] == "fixed"
+                                else "flow_end",
+                                self.convert_qty_uom(
+                                    j["product_qty"],
+                                    j["product_uom"],
+                                    j["product_id"][0],
+                                ),
+                                quoteattr(product["name"]),
+                            )
+                    yield "</flows>\n"
+
+                    # Create loads
+                    if i["id"] and not subcontractor:
+                        exists = False
+                        for j in mrp_routing_workcenters.get(i["id"], []):
+                            if (
+                                not j["workcenter_id"]
+                                or j["workcenter_id"][0] not in self.map_workcenters
+                            ):
+                                continue
+                            if not exists:
+                                exists = True
+                                yield "<loads>\n"
+                            yield '<load quantity="%f" search=%s><resource name=%s/>%s</load>\n' % (
+                                j["time_cycle"],
+                                quoteattr(j["search_mode"]),
+                                quoteattr(self.map_workcenters[j["workcenter_id"][0]]),
+                                ("<skill name=%s/>" % quoteattr(j["skill"][1]))
+                                if j["skill"]
+                                else "",
+                            )
+                        if exists:
+                            yield "</loads>\n"
+                else:
+                    #
+                    # CASE 2: A routing operation is created with a suboperation for each
+                    # routing step.
+                    #
+                    yield '<operation name=%s size_multiple="1" posttime="P%dD" priority="%s" xsi:type="operation_routing">' "<item name=%s/><location name=%s/>\n" % (
+                        quoteattr(operation),
+                        self.manufacturing_lead,
+                        i["sequence"] or 1,
+                        quoteattr(product_buf["name"]),
+                        quoteattr(location),
+                    )
+
+                    yield "<suboperations>"
+
+                    fl = {}
+                    for j in self.generator.getData(
+                        "mrp.bom.line",
+                        ids=i["bom_line_ids"],
+                        fields=[
+                            "product_qty",
+                            "product_uom_id",
+                            "product_id",
+                            "operation_id",
+                        ],
+                    ):
+                        product = self.product_product.get(j["product_id"][0], None)
+                        if not product:
+                            continue
+                        qty = self.convert_qty_uom(
+                            j["product_qty"],
+                            j["product_uom_id"],
+                            self.product_product[j["product_id"][0]]["template"],
+                        )
+                        if j["product_id"][0] in fl:
+                            # If the same component is consumed multiple times in the same BOM
+                            # we sum up all quantities in a single flow. We assume all of them
+                            # have the same effectivity.
+                            fl[j["product_id"][0]]["qty"] += qty
+                        else:
+                            j["qty"] = qty
+                            fl[j["product_id"][0]] = j
+
+                    steplist = mrp_routing_workcenters[i["id"]]
+                    counter = 0
+                    for step in steplist:
+                        counter = counter + 1
+                        suboperation = step["name"]
+                        name = "%s - %s - %s" % (operation, suboperation, step["id"])
+                        if len(name) > 300:
+                            suffix = " - %s - %s" % (
+                                suboperation,
+                                step["id"],
+                            )
+                            name = "%s%s" % (
+                                operation[: 300 - len(suffix)],
+                                suffix,
+                            )
+                        if (
+                            not step["workcenter_id"]
+                            or step["workcenter_id"][0] not in self.map_workcenters
+                        ):
+                            continue
+                        yield "<suboperation>" '<operation name=%s priority="%s" duration_per="%s" xsi:type="operation_time_per">\n' "<location name=%s/>\n" '<loads><load quantity="%f" search=%s><resource name=%s/>%s</load></loads>\n' % (
+                            quoteattr(name),
+                            counter * 10,
+                            self.convert_float_time(step["time_cycle"] / 1440.0)
+                            if step["time_cycle"] and step["time_cycle"] > 0
+                            else "P0D",
+                            quoteattr(location),
+                            1,
+                            quoteattr(step["search_mode"]),
+                            quoteattr(self.map_workcenters[step["workcenter_id"][0]]),
+                            ("<skill name=%s/>" % quoteattr(step["skill"][1]))
+                            if step["skill"]
+                            else "",
+                        )
+                        first_flow = True
+                        if counter == len(steplist):
+                            # Add producing flows on the last routing step
+                            first_flow = False
+                            yield '<flows>\n<flow xsi:type="flow_end" quantity="%f"><item name=%s/></flow>\n' % (
+                                i["product_qty"]
+                                * getattr(i, "product_efficiency", 1.0)
+                                * uom_factor,
+                                quoteattr(product_buf["name"]),
+                            )
+                            self.bom_producedQty[(name, product_buf["name"],)] = (
+                                i["product_qty"]
+                                * getattr(i, "product_efficiency", 1.0)
+                                * uom_factor
+                            )
+                        for j in fl.values():
+                            if j["qty"] > 0 and (
+                                (
+                                    j["operation_id"]
+                                    and j["operation_id"][0] == step["id"]
+                                )
+                                or (not j["operation_id"] and step == steplist[0])
+                            ):
+                                if first_flow:
+                                    first_flow = False
+                                    yield "<flows>\n"
+                                yield '<flow xsi:type="flow_start" quantity="-%f"><item name=%s/></flow>\n' % (
+                                    j["qty"],
+                                    quoteattr(
+                                        self.product_product[j["product_id"][0]]["name"]
+                                    ),
+                                )
+                        if not first_flow:
+                            yield "</flows>\n"
+                        yield "</operation></suboperation>\n"
+                    yield "</suboperations>\n"
+                yield "</operation>\n"
         yield "</operations>\n"
 
     def export_salesorders(self):
@@ -963,57 +1262,76 @@ class exporter(object):
         (if sale.order.picking_policy = 'one' then same as demand.quantity else 1) -> demand.minshipment
         """
         # Get all sales order lines
-        m = self.env["sale.order.line"]
-        recs = m.search([("product_id", "!=", False)])
-        fields = [
-            "qty_delivered",
-            "state",
-            "product_id",
-            "product_uom_qty",
-            "product_uom",
-            "order_id",
-        ]
-        so_line = [i for i in recs.read(fields)]
+        so_line = self.generator.getData(
+            "sale.order.line",
+            search=[("product_id", "!=", False)],
+            fields=[
+                "qty_delivered",
+                "state",
+                "product_id",
+                "product_uom_qty",
+                "product_uom",
+                "order_id",
+            ],
+        )
 
         # Get all sales orders
-        m = self.env["sale.order"]
-        ids = [i["order_id"][0] for i in so_line]
-        fields = [
-            "state",
-            "partner_id",
-            "requested_date",
-            "date_order",
-            "picking_policy",
-            "warehouse_id",
-            "picking_ids",
-        ]
-        so = {}
-        for i in m.browse(ids).read(fields):
-            so[i["id"]] = i
+        so = {
+            i["id"]: i
+            for i in self.generator.getData(
+                "sale.order",
+                ids=[j["order_id"][0] for j in so_line],
+                fields=[
+                    "state",
+                    "partner_id",
+                    "commitment_date",
+                    "date_order",
+                    "picking_policy",
+                    "warehouse_id",
+                ],
+            )
+        }
 
         # Generate the demand records
         yield "<!-- sales order lines -->\n"
         yield "<demands>\n"
 
         for i in so_line:
-            name = u"%s %d" % (i["order_id"][1], i["id"])
+            name = "%s %d" % (i["order_id"][1], i["id"])
+            batch = i["order_id"][1]
             product = self.product_product.get(i["product_id"][0], None)
             j = so[i["order_id"][0]]
             location = j["warehouse_id"][1]
             customer = self.map_customers.get(j["partner_id"][0], None)
+            if not customer:
+                # The customer may be an individual.
+                # We check whether his/her company is in the map.
+                for c in self.generator.getData(
+                    "res.partner",
+                    ids=[j["partner_id"][0]],
+                    fields=["commercial_partner_id"],
+                ):
+                    customer = self.map_customers.get(
+                        c["commercial_partner_id"][0], None
+                    )
+                    if customer:
+                        break
             if not customer or not location or not product:
                 # Not interested in this sales order...
                 continue
-            due = j.get("requested_date", False) or j["date_order"]
+            due = self.formatDateTime(
+                j.get("commitment_date", False) or j["date_order"]
+            )
             priority = 1  # We give all customer orders the same default priority
 
             # Possible sales order status are 'draft', 'sent', 'sale', 'done' and 'cancel'
             state = j.get("state", "sale")
-            if state == "draft":
-                status = "quote"
+            if state in ("draft", "sent"):
+                # status = "inquiry"  # Inquiries don't reserve capacity and materials
+                status = "quote"  # Quotes do reserve capacity and materials
                 qty = self.convert_qty_uom(
                     i["product_uom_qty"],
-                    i["product_uom"][0],
+                    i["product_uom"],
                     self.product_product[i["product_id"][0]]["template"],
                 )
             elif state == "sale":
@@ -1022,30 +1340,33 @@ class exporter(object):
                     status = "closed"
                     qty = self.convert_qty_uom(
                         i["product_uom_qty"],
-                        i["product_uom"][0],
+                        i["product_uom"],
                         self.product_product[i["product_id"][0]]["template"],
                     )
                 else:
                     status = "open"
                     qty = self.convert_qty_uom(
                         qty,
-                        i["product_uom"][0],
+                        i["product_uom"],
                         self.product_product[i["product_id"][0]]["template"],
                     )
-            elif state in ("done", "sent"):
+            elif state in "done":
                 status = "closed"
                 qty = self.convert_qty_uom(
                     i["product_uom_qty"],
-                    i["product_uom"][0],
+                    i["product_uom"],
                     self.product_product[i["product_id"][0]]["template"],
                 )
             elif state == "cancel":
                 status = "canceled"
                 qty = self.convert_qty_uom(
                     i["product_uom_qty"],
-                    i["product_uom"][0],
+                    i["product_uom"],
                     self.product_product[i["product_id"][0]]["template"],
                 )
+            else:
+                logger.warning("Unknown sales order state: %s." % (state,))
+                continue
 
             #           pick = self.req.session.model('stock.picking')
             #           p_fields = ['move_lines', 'sale_id', 'state']
@@ -1084,12 +1405,13 @@ class exporter(object):
             #                             priority, minship,status, quoteattr(product['name']),
             #                             quoteattr(customer), quoteattr(location)
             #                         )
-            yield '<demand name=%s quantity="%s" due="%s" priority="%s" minshipment="%s" status="%s"><item name=%s/><customer name=%s/><location name=%s/></demand>\n' % (
+            yield '<demand name=%s batch=%s quantity="%s" due="%s" priority="%s" minshipment="%s" status="%s"><item name=%s/><customer name=%s/><location name=%s/></demand>\n' % (
                 quoteattr(name),
+                quoteattr(batch),
                 qty,
-                due.strftime("%Y-%m-%dT%H:%M:%S"),
+                due,
                 priority,
-                j["picking_policy"] == "one" and qty or 1.0,
+                j["picking_policy"] == "one" and qty or 0.0,
                 status,
                 quoteattr(product["name"]),
                 quoteattr(customer),
@@ -1116,37 +1438,42 @@ class exporter(object):
         'PO' -> operationplan.ordertype
         'confirmed' -> operationplan.status
         """
-        m = self.env["purchase.order.line"]
-        recs = m.search(
-            [
+        po_line = self.generator.getData(
+            "purchase.order.line",
+            search=[
                 "|",
                 (
                     "order_id.state",
                     "not in",
+                    # Comment out on of the following alternative approaches:
+                    # Alternative I: don't send RFQs to frepple because that supply isn't certain to be available yet.
                     ("draft", "sent", "bid", "confirmed", "cancel"),
+                    # Alternative II: send RFQs to frepple to avoid that the same purchasing proposal is generated again by frepple.
+                    # ("bid", "confirmed", "cancel"),
                 ),
                 ("order_id.state", "=", False),
-            ]
+            ],
+            fields=[
+                "name",
+                "date_planned",
+                "product_id",
+                "product_qty",
+                "qty_received",
+                "product_uom",
+                "order_id",
+                "state",
+            ],
         )
-        fields = [
-            "name",
-            "date_planned",
-            "product_id",
-            "product_qty",
-            "qty_received",
-            "product_uom",
-            "order_id",
-            "state",
-        ]
-        po_line = [i for i in recs.read(fields)]
 
         # Get all purchase orders
-        m = self.env["purchase.order"]
-        ids = [i["order_id"][0] for i in po_line]
-        fields = ["name", "company_id", "partner_id", "state", "date_order"]
-        po = {}
-        for i in m.browse(ids).read(fields):
-            po[i["id"]] = i
+        po = {
+            i["id"]: i
+            for i in self.generator.getData(
+                "purchase.order",
+                ids=[j["order_id"][0] for j in po_line],
+                fields=["name", "company_id", "partner_id", "state", "date_order"],
+            )
+        }
 
         # Create purchasing operations
         yield "<!-- open purchase orders -->\n"
@@ -1161,11 +1488,11 @@ class exporter(object):
                 continue
             location = self.mfg_location
             if location and item and i["product_qty"] > i["qty_received"]:
-                start = j["date_order"].strftime("%Y-%m-%dT%H:%M:%S")
-                end = i["date_planned"].strftime("%Y-%m-%dT%H:%M:%S")
+                start = self.formatDateTime(j["date_order"])
+                end = self.formatDateTime(i["date_planned"])
                 qty = self.convert_qty_uom(
                     i["product_qty"] - i["qty_received"],
-                    i["product_uom"][0],
+                    i["product_uom"],
                     self.product_product[i["product_id"][0]]["template"],
                 )
                 yield '<operationplan reference=%s ordertype="PO" start="%s" end="%s" quantity="%f" status="confirmed">' "<item name=%s/><location name=%s/><supplier name=%s/>" % (
@@ -1195,42 +1522,45 @@ class exporter(object):
         """
         yield "<!-- manufacturing orders in progress -->\n"
         yield "<operationplans>\n"
-        m = self.env["mrp.production"]
-        recs = m.search([("state", "in", ["confirmed", "planned", "progress"])])
-        fields = [
-            "bom_id",
-            "date_start",
-            "date_planned_start",
-            "name",
-            "state",
-            "product_qty",
-            "product_uom_id",
-            "location_dest_id",
-            "product_id",
-        ]
-        for i in recs.read(fields):
+        for i in self.generator.getData(
+            "mrp.production",
+            search=[("state", "in", ["progress", "confirmed", "to_close"])],
+            fields=[
+                "bom_id",
+                "date_start",
+                "date_planned_start",
+                "name",
+                "state",
+                "product_qty",
+                "product_uom_id",
+                "location_dest_id",
+                "product_id",
+            ],
+        ):
             if i["bom_id"]:
                 # Open orders
-                location = self.map_locations.get(i["location_dest_id"][0], None)
+                location = (
+                    "GN-WH"  # self.map_locations.get(i["location_dest_id"][0], None)
+                )
                 item = (
                     self.product_product[i["product_id"][0]]
                     if i["product_id"][0] in self.product_product
                     else None
                 )
-                if not item:
+                if not item or not location:
                     continue
-                operation = u"%d %s @ %s" % (
-                    i["bom_id"][0],
+                operation = "%s @ %s %d" % (
                     item["name"],
-                    i["location_dest_id"][1],
+                    location,
+                    i["bom_id"][0],
                 )
                 try:
-                    startdate = str(i["date_start"] or i["date_planned_start"]).replace(
-                        " ", "T"
+                    startdate = self.formatDateTime(
+                        i["date_start"] if i["date_start"] else i["date_planned_start"]
                     )
                 except Exception:
                     continue
-                if not location or operation not in self.operations:
+                if operation not in self.operations:
                     continue
                 factor = (
                     self.bom_producedQty[(operation, item["name"])]
@@ -1240,18 +1570,57 @@ class exporter(object):
                 qty = (
                     self.convert_qty_uom(
                         i["product_qty"],
-                        i["product_uom_id"][0],
+                        i["product_uom_id"],
                         self.product_product[i["product_id"][0]]["template"],
                     )
                     / factor
                 )
-                yield '<operationplan type="MO" reference=%s start="%s" quantity="%s" status="confirmed"><operation name=%s/></operationplan>\n' % (
+                yield '<operationplan type="MO" reference=%s start="%s" quantity="%s" status="%s"><operation name=%s/></operationplan>\n' % (
                     quoteattr(i["name"]),
                     startdate,
                     qty,
+                    # "approved",  # In the "approved" status, frepple can still reschedule the MO in function of material and capacity
+                    "confirmed",  # In the "confirmed" status, frepple sees the MO as frozen and unchangeable
                     quoteattr(operation),
                 )
         yield "</operationplans>\n"
+
+    def export_minimum_stock_level(self):
+        """
+        Read minimum stock levels from product_template.
+        If minimum stock level is defined, the reordering rules are ignored
+        for this product
+        """
+        first = True
+        self.hasMinimumStock = []
+
+        for i in self.product_product:
+            tmpl = self.product_templates[self.product_product[i]["template"]]
+            if not tmpl["minimum_stock_level"]:
+                continue
+
+            self.hasMinimumStock.append(i)
+
+            if first:
+                yield "<!-- minimum stock levels -->\n"
+                yield "<calendars>\n"
+                first = False
+
+            # we have no location to grab, pick any warehouse
+            # location aggregation in commands.py will do the job
+
+            name = u"%s @ %s" % (self.product_product[i]["name"], "GN-WH")
+            yield """
+            <calendar name=%s default="0"><buckets>
+            <bucket start="2000-01-01T00:00:00" end="2030-01-01T00:00:00" value="%s" days="127" priority="998" starttime="PT0M" endtime="PT1440M"/>
+            </buckets>
+            </calendar>\n
+            """ % (
+                (quoteattr("SS for %s" % (name,))),
+                (tmpl["minimum_stock_level"]),
+            )
+        if not first:
+            yield "</calendars>\n"
 
     def export_orderpoints(self):
         """
@@ -1266,52 +1635,59 @@ class exporter(object):
         convert stock.warehouse.orderpoint.product_max_qty -> buffer.maxinventory
         convert stock.warehouse.orderpoint.qty_multiple -> buffer->size_multiple
         """
+        first = True
 
-        m = self.env["stock.warehouse.orderpoint"]
-        recs = m.search([])
-        fields = [
-            "warehouse_id",
-            "product_id",
-            "product_min_qty",
-            "product_max_qty",
-            "product_uom",
-            "qty_multiple",
-        ]
-        if recs:
-            yield "<!-- order points -->\n"
-            yield "<calendars>\n"
-            for i in recs.read(fields):
-                item = self.product_product.get(
-                    i["product_id"] and i["product_id"][0] or 0, None
+        for i in self.generator.getData(
+            "stock.warehouse.orderpoint",
+            fields=[
+                "warehouse_id",
+                "product_id",
+                "product_min_qty",
+                "product_max_qty",
+                "product_uom",
+                "qty_multiple",
+            ],
+        ):
+
+            if i["product_id"] in self.hasMinimumStock:
+                continue
+
+            if first:
+                yield "<!-- order points -->\n"
+                yield "<calendars>\n"
+                first = False
+            item = self.product_product.get(
+                i["product_id"] and i["product_id"][0] or 0, None
+            )
+            if not item:
+                continue
+            uom_factor = self.convert_qty_uom(
+                1.0,
+                i["product_uom"][0],
+                self.product_product[i["product_id"][0]]["template"],
+            )
+            name = u"%s @ %s" % (item["name"], i["warehouse_id"][1])
+            if i["product_min_qty"]:
+                yield """
+                <calendar name=%s default="0"><buckets>
+                <bucket start="2000-01-01T00:00:00" end="2030-01-01T00:00:00" value="%s" days="127" priority="998" starttime="PT0M" endtime="PT1440M"/>
+                </buckets>
+                </calendar>\n
+                """ % (
+                    (quoteattr("SS for %s" % (name,))),
+                    (i["product_min_qty"] * uom_factor),
                 )
-                if not item:
-                    continue
-                uom_factor = self.convert_qty_uom(
-                    1.0,
-                    i["product_uom"][0],
-                    self.product_product[i["product_id"][0]]["template"],
+            if i["product_max_qty"] - i["product_min_qty"] > 0:
+                yield """
+                <calendar name=%s default="0"><buckets>
+                <bucket start="2000-01-01T00:00:00" end="2030-01-01T00:00:00" value="%s" days="127" priority="998" starttime="PT0M" endtime="PT1440M"/>
+                </buckets>
+                </calendar>\n
+                """ % (
+                    (quoteattr("ROQ for %s" % (name,))),
+                    ((i["product_max_qty"] - i["product_min_qty"]) * uom_factor),
                 )
-                name = u"%s @ %s" % (item["name"], i["warehouse_id"][1])
-                if i["product_min_qty"]:
-                    yield """
-                    <calendar name=%s default="0"><buckets>
-                    <bucket start="2000-01-01T00:00:00" end="2030-01-01T00:00:00" value="%s" days="127" priority="998" starttime="PT0M" endtime="PT1440M"/>
-                    </buckets>
-                    </calendar>\n
-                    """ % (
-                        (quoteattr("SS for %s" % (name,))),
-                        (i["product_min_qty"] * uom_factor),
-                    )
-                if i["product_max_qty"] - i["product_min_qty"] > 0:
-                    yield """
-                    <calendar name=%s default="0"><buckets>
-                    <bucket start="2000-01-01T00:00:00" end="2030-01-01T00:00:00" value="%s" days="127" priority="998" starttime="PT0M" endtime="PT1440M"/>
-                    </buckets>
-                    </calendar>\n
-                    """ % (
-                        (quoteattr("ROQ for %s" % (name,))),
-                        ((i["product_max_qty"] - i["product_min_qty"]) * uom_factor),
-                    )
+        if not first:
             yield "</calendars>\n"
 
     def export_onhand(self):
@@ -1328,15 +1704,32 @@ class exporter(object):
         """
         yield "<!-- inventory -->\n"
         yield "<buffers>\n"
-        self.env.cr.execute(
-            "SELECT product_id, location_id, sum(quantity) "
-            "FROM stock_quant "
-            "WHERE quantity > 0 "
-            "GROUP BY product_id, location_id "
-            "ORDER BY location_id ASC"
-        )
+        if isinstance(self.generator, Odoo_generator):
+            # SQL query gives much better performance
+            self.generator.env.cr.execute(
+                """
+                SELECT stock_quant.product_id, stock_quant.location_id, sum(stock_quant.quantity)
+                FROM stock_quant
+                inner join stock_location on stock_location.id = stock_quant.location_id
+                WHERE stock_quant.quantity > 0
+                and coalesce(stock_location.quality_location, false) = false
+                GROUP BY stock_quant.product_id, stock_quant.location_id
+                ORDER BY stock_quant.location_id ASC
+               """
+            )
+            data = self.generator.env.cr.fetchall()
+        else:
+            data = [
+                (i["product_id"][0], i["location_id"][0], i["quantity"])
+                for i in self.generator.getData(
+                    "stock.quant",
+                    search=[("quantity", ">", 0)],
+                    fields=["product_id", "location_id", "quantity"],
+                )
+                if i["product_id"] and i["location_id"]
+            ]
         inventory = {}
-        for i in self.env.cr.fetchall():
+        for i in data:
             item = self.product_product.get(i[0], None)
             location = self.map_locations.get(i[1], None)
             if item and location:
@@ -1352,3 +1745,58 @@ class exporter(object):
                 quoteattr(key[1]),
             )
         yield "</buffers>\n"
+
+
+if __name__ == "__main__":
+    #
+    # When calling this script directly as a Python file, the connector uses XMLRPC
+    # to connect to odoo and download all data.
+    #
+    # This is useful for debugging connector updates remotely, when you don't have
+    # direct access to the odoo server itself.
+    # This mode of working is not recommended for production use because of performance
+    # considerations.
+    #
+    #  EXPERIMENTAL FEATURE!!!
+    #
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Debug frepple odoo connector")
+    parser.add_argument(
+        "--url", help="URL of the odoo server", default="http://localhost:8069"
+    )
+    parser.add_argument("--db", help="Odoo database to connect to", default="odoo14")
+    parser.add_argument(
+        "--username", help="User name for the odoo connection", default="admin"
+    )
+    parser.add_argument(
+        "--password", help="User password for the odoo connection", default="admin"
+    )
+    parser.add_argument(
+        "--company", help="Odoo company to use", default="My Company (Chicago)"
+    )
+    parser.add_argument(
+        "--timezone", help="Time zone to convert odoo datetime fields to", default="UTC"
+    )
+    parser.add_argument(
+        "--singlecompany",
+        default=False,
+        help="Limit the data to a single company only.",
+        action="store_true",
+    )
+    args = parser.parse_args()
+
+    generator = XMLRPC_generator(args.url, args.db, args.username, args.password)
+    xp = exporter(
+        generator,
+        None,
+        uid=generator.uid,
+        database=generator.db,
+        company=args.company,
+        mode=1,
+        timezone=args.timezone,
+        singlecompany=True,
+    )
+    for i in xp.run():
+        print(i, end="")
+
