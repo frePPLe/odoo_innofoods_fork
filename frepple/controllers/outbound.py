@@ -245,6 +245,9 @@ class exporter(object):
             logger.debug("Exporting manufacturing orders.")
             for i in self.export_manufacturingorders():
                 yield i
+            logger.debug("Exporting minimum stock levels.")
+            for i in self.export_minimum_stock_level():
+                yield i
             logger.debug("Exporting reordering rules.")
             for i in self.export_orderpoints():
                 yield i
@@ -295,7 +298,6 @@ class exporter(object):
     def load_uom(self):
         """
         Loading units of measures into a dictionary for fast lookups.
-
         All quantities are sent to frePPLe as numbers, expressed in the default
         unit of measure of the uom dimension.
         """
@@ -312,10 +314,10 @@ class exporter(object):
                 f = 1.0
                 self.uom_categories[i["category_id"][0]] = i["id"]
             elif i["uom_type"] == "bigger":
-                f = 1 / i["factor"]
+                f = i["factor"]
             else:
                 if i["factor"] > 0:
-                    f = i["factor"]
+                    f = 1 / i["factor"]
                 else:
                     f = 1.0
             self.uom[i["id"]] = {
@@ -395,10 +397,11 @@ class exporter(object):
         cal_tz = {}
         cal_ids = set()
         try:
-
+            logger.info("Entering calendars")
             # Read the timezone
             for i in self.generator.getData(
                 "resource.calendar",
+                search=[("name", "!=", "Holyday")],
                 fields=[
                     "name",
                     "tz",
@@ -424,7 +427,6 @@ class exporter(object):
                         calendars[i["calendar_id"][1]] = []
                     i["attendance"] = True
                     calendars[i["calendar_id"][1]].append(i)
-
             # Read the leaves for all calendars
             for i in self.generator.getData(
                 "resource.calendar.leaves",
@@ -435,6 +437,7 @@ class exporter(object):
                     "calendar_id",
                 ],
             ):
+                logger.info("Entering loop 1")
                 if i["calendar_id"] and i["calendar_id"][0] in cal_ids:
                     if i["calendar_id"][1] not in calendars:
                         calendars[i["calendar_id"][1]] = []
@@ -727,13 +730,14 @@ class exporter(object):
         self.product_templates = {}
         for i in self.generator.getData(
             "product.template",
-            search=[("type", "not in", ("service", "consu"))],
+            search=[("type", "!=", "service")],
             fields=[
                 "purchase_ok",
                 "produce_delay",
                 "list_price",
                 "uom_id",
                 "categ_id",
+                "minimum_stock_level",
             ],
         ):
             self.product_templates[i["id"]] = i
@@ -1534,7 +1538,9 @@ class exporter(object):
         ):
             if i["bom_id"]:
                 # Open orders
-                location = self.map_locations.get(i["location_dest_id"][0], None)
+                location = (
+                    "GN-WH"  # self.map_locations.get(i["location_dest_id"][0], None)
+                )
                 item = (
                     self.product_product[i["product_id"][0]]
                     if i["product_id"][0] in self.product_product
@@ -1578,6 +1584,43 @@ class exporter(object):
                 )
         yield "</operationplans>\n"
 
+    def export_minimum_stock_level(self):
+        """
+        Read minimum stock levels from product_template.
+        If minimum stock level is defined, the reordering rules are ignored
+        for this product
+        """
+        first = True
+        self.hasMinimumStock = []
+
+        for i in self.product_product:
+            tmpl = self.product_templates[self.product_product[i]["template"]]
+            if not tmpl["minimum_stock_level"]:
+                continue
+
+            self.hasMinimumStock.append(i)
+
+            if first:
+                yield "<!-- minimum stock levels -->\n"
+                yield "<calendars>\n"
+                first = False
+
+            # we have no location to grab, pick any warehouse
+            # location aggregation in commands.py will do the job
+
+            name = u"%s @ %s" % (self.product_product[i]["name"], "GN-WH")
+            yield """
+            <calendar name=%s default="0"><buckets>
+            <bucket start="2000-01-01T00:00:00" end="2030-01-01T00:00:00" value="%s" days="127" priority="998" starttime="PT0M" endtime="PT1440M"/>
+            </buckets>
+            </calendar>\n
+            """ % (
+                (quoteattr("SS for %s" % (name,))),
+                (tmpl["minimum_stock_level"]),
+            )
+        if not first:
+            yield "</calendars>\n"
+
     def export_orderpoints(self):
         """
         Defining order points for frePPLe, based on the stock.warehouse.orderpoint
@@ -1592,6 +1635,7 @@ class exporter(object):
         convert stock.warehouse.orderpoint.qty_multiple -> buffer->size_multiple
         """
         first = True
+
         for i in self.generator.getData(
             "stock.warehouse.orderpoint",
             fields=[
@@ -1603,6 +1647,10 @@ class exporter(object):
                 "qty_multiple",
             ],
         ):
+
+            if i["product_id"] in self.hasMinimumStock:
+                continue
+
             if first:
                 yield "<!-- order points -->\n"
                 yield "<calendars>\n"
@@ -1658,11 +1706,15 @@ class exporter(object):
         if isinstance(self.generator, Odoo_generator):
             # SQL query gives much better performance
             self.generator.env.cr.execute(
-                "SELECT product_id, location_id, sum(quantity) "
-                "FROM stock_quant "
-                "WHERE quantity > 0 "
-                "GROUP BY product_id, location_id "
-                "ORDER BY location_id ASC"
+                """
+                SELECT stock_quant.product_id, stock_quant.location_id, sum(stock_quant.quantity)
+                FROM stock_quant
+                inner join stock_location on stock_location.id = stock_quant.location_id
+                WHERE stock_quant.quantity > 0
+                and coalesce(stock_location.quality_location, false) = false
+                GROUP BY stock_quant.product_id, stock_quant.location_id
+                ORDER BY stock_quant.location_id ASC
+               """
             )
             data = self.generator.env.cr.fetchall()
         else:
