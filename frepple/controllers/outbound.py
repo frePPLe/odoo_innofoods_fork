@@ -298,6 +298,7 @@ class exporter(object):
     def load_uom(self):
         """
         Loading units of measures into a dictionary for fast lookups.
+
         All quantities are sent to frePPLe as numbers, expressed in the default
         unit of measure of the uom dimension.
         """
@@ -311,17 +312,9 @@ class exporter(object):
             fields=["factor", "uom_type", "category_id", "name"],
         ):
             if i["uom_type"] == "reference":
-                f = 1.0
                 self.uom_categories[i["category_id"][0]] = i["id"]
-            elif i["uom_type"] == "bigger":
-                f = i["factor"]
-            else:
-                if i["factor"] > 0:
-                    f = 1 / i["factor"]
-                else:
-                    f = 1.0
             self.uom[i["id"]] = {
-                "factor": f,
+                "factor": i["factor"],
                 "category": i["category_id"][0],
                 "name": i["name"],
             }
@@ -347,7 +340,7 @@ class exporter(object):
             return qty
         # check if different uoms belong to the same category
         if self.uom[product_uom]["category"] == self.uom[uom_id]["category"]:
-            return qty * self.uom[uom_id]["factor"] / self.uom[product_uom]["factor"]
+            return qty / self.uom[uom_id]["factor"] * self.uom[product_uom]["factor"]
         else:
             # UOM is from a different category as the reference uom of the product.
             logger.warning(
@@ -738,6 +731,7 @@ class exporter(object):
                 "uom_id",
                 "categ_id",
                 "minimum_stock_level",
+                "responsible_id",
             ],
         ):
             self.product_templates[i["id"]] = i
@@ -781,7 +775,7 @@ class exporter(object):
             self.product_product[i["id"]] = prod_obj
             self.product_template_product[i["product_tmpl_id"][0]] = prod_obj
             # For make-to-order items the next line needs to XML snippet ' type="item_mto"'.
-            yield '<item name=%s uom=%s volume="%f" weight="%f" cost="%f" category=%s subcategory="%s,%s">\n' % (
+            yield '<item name=%s uom=%s volume="%f" weight="%f" cost="%f" category=%s subcategory="%s,%s"><stringproperty name="responsible" value=%s/>\n' % (
                 quoteattr(name),
                 quoteattr(tmpl["uom_id"][1]) if tmpl["uom_id"] else "",
                 i["volume"] or 0,
@@ -791,7 +785,7 @@ class exporter(object):
                 quoteattr(
                     "%s%s"
                     % (
-                        ("%s/" % self.category_parent(tmpl["categ_id"][1]))
+                        ("%s/" % (self.category_parent[tmpl["categ_id"][1]],))
                         if tmpl["categ_id"][1] in self.category_parent
                         else "",
                         tmpl["categ_id"][1],
@@ -801,6 +795,9 @@ class exporter(object):
                 else '""',
                 self.uom_categories[self.uom[tmpl["uom_id"][0]]["category"]],
                 i["id"],
+                quoteattr(tmpl["responsible_id"][1])
+                if tmpl["responsible_id"]
+                else '""',
             )
             # Export suppliers for the item, if the item is allowed to be purchased
             if tmpl["purchase_ok"]:
