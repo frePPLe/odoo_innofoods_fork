@@ -925,6 +925,12 @@ class exporter(object):
         # Loop over all bom records
         for i in self.generator.getData(
             "mrp.bom",
+            search=[
+                ("code", "not ilike", "unpack"),
+                ("code", "not ilike", "rework"),
+                ("code", "not ilike", "rebake"),
+                ("code", "not ilike", "re-bake"),
+            ],
             fields=[
                 "product_qty",
                 "product_uom_id",
