@@ -1449,7 +1449,7 @@ class exporter(object):
                     "not in",
                     # Comment out on of the following alternative approaches:
                     # Alternative I: don't send RFQs to frepple because that supply isn't certain to be available yet.
-                    ("draft", "sent", "bid", "confirmed", "cancel"),
+                    ("draft", "to approve", "sent", "bid", "confirmed", "cancel"),
                     # Alternative II: send RFQs to frepple to avoid that the same purchasing proposal is generated again by frepple.
                     # ("bid", "confirmed", "cancel"),
                 ),
