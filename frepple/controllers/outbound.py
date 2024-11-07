@@ -449,32 +449,42 @@ class exporter(object):
                 yield '<calendar name=%s default="0"><buckets>\n' % quoteattr(i)
                 for j in calendars[i]:
                     yield '<bucket start="%s" end="%s" value="%s" days="%s" priority="%s" starttime="%s" endtime="%s"/>\n' % (
-                        self.formatDateTime(j["date_from"], cal_tz[i])
-                        if not j["attendance"]
-                        else (
-                            j["date_from"].strftime("%Y-%m-%dT00:00:00")
-                            if j["date_from"]
-                            else "2000-01-01T00:00:00"
+                        (
+                            self.formatDateTime(j["date_from"], cal_tz[i])
+                            if not j["attendance"]
+                            else (
+                                j["date_from"].strftime("%Y-%m-%dT00:00:00")
+                                if j["date_from"]
+                                else "2000-01-01T00:00:00"
+                            )
                         ),
-                        self.formatDateTime(j["date_to"], cal_tz[i])
-                        if not j["attendance"]
-                        else (
-                            j["date_to"].strftime("%Y-%m-%dT00:00:00")
-                            if j["date_to"]
-                            else "2030-01-01T00:00:00"
+                        (
+                            self.formatDateTime(j["date_to"], cal_tz[i])
+                            if not j["attendance"]
+                            else (
+                                j["date_to"].strftime("%Y-%m-%dT00:00:00")
+                                if j["date_to"]
+                                else "2030-01-01T00:00:00"
+                            )
                         ),
                         "1" if j["attendance"] else "0",
-                        (2 ** ((int(j["dayofweek"]) + 1) % 7))
-                        if "dayofweek" in j
-                        else (2 ** 7) - 1,
+                        (
+                            (2 ** ((int(j["dayofweek"]) + 1) % 7))
+                            if "dayofweek" in j
+                            else (2**7) - 1
+                        ),
                         priority_attendance if j["attendance"] else priority_leave,
                         # In odoo, monday = 0. In frePPLe, sunday = 0.
-                        ("PT%dM" % round(j["hour_from"] * 60))
-                        if "hour_from" in j
-                        else "PT0M",
-                        ("PT%dM" % round(j["hour_to"] * 60))
-                        if "hour_to" in j
-                        else "PT1440M",
+                        (
+                            ("PT%dM" % round(j["hour_from"] * 60))
+                            if "hour_from" in j
+                            else "PT0M"
+                        ),
+                        (
+                            ("PT%dM" % round(j["hour_to"] * 60))
+                            if "hour_to" in j
+                            else "PT1440M"
+                        ),
                     )
                     if j["attendance"]:
                         priority_attendance += 1
@@ -782,22 +792,28 @@ class exporter(object):
                 i["weight"] or 0,
                 max(0, tmpl["list_price"] or 0)
                 / self.convert_qty_uom(1.0, tmpl["uom_id"], i["product_tmpl_id"][0]),
-                quoteattr(
-                    "%s%s"
-                    % (
-                        ("%s/" % (self.category_parent[tmpl["categ_id"][1]],))
-                        if tmpl["categ_id"][1] in self.category_parent
-                        else "",
-                        tmpl["categ_id"][1],
+                (
+                    quoteattr(
+                        "%s%s"
+                        % (
+                            (
+                                ("%s/" % (self.category_parent[tmpl["categ_id"][1]],))
+                                if tmpl["categ_id"][1] in self.category_parent
+                                else ""
+                            ),
+                            tmpl["categ_id"][1],
+                        )
                     )
-                )
-                if tmpl["categ_id"]
-                else '""',
+                    if tmpl["categ_id"]
+                    else '""'
+                ),
                 self.uom_categories[self.uom[tmpl["uom_id"][0]]["category"]],
                 i["id"],
-                quoteattr(tmpl["responsible_id"][1])
-                if tmpl["responsible_id"]
-                else '""',
+                (
+                    quoteattr(tmpl["responsible_id"][1])
+                    if tmpl["responsible_id"]
+                    else '""'
+                ),
             )
             # Export suppliers for the item, if the item is allowed to be purchased
             if tmpl["purchase_ok"]:
@@ -849,14 +865,18 @@ class exporter(object):
                             sup["batching_window"] or 0,
                             sup["min_qty"],
                             max(0, sup["price"]),
-                            ' effective_end="%sT00:00:00"'
-                            % sup["date_end"].strftime("%Y-%m-%d")
-                            if sup["date_end"]
-                            else "",
-                            ' effective_start="%sT00:00:00"'
-                            % sup["date_start"].strftime("%Y-%m-%d")
-                            if sup["date_start"]
-                            else "",
+                            (
+                                ' effective_end="%sT00:00:00"'
+                                % sup["date_end"].strftime("%Y-%m-%d")
+                                if sup["date_end"]
+                                else ""
+                            ),
+                            (
+                                ' effective_start="%sT00:00:00"'
+                                % sup["date_start"].strftime("%Y-%m-%d")
+                                if sup["date_start"]
+                                else ""
+                            ),
                             quoteattr(name),
                         )
                 if exists:
@@ -1010,9 +1030,11 @@ class exporter(object):
                         )
                         yield '<operation name=%s size_multiple="1" duration_per="%s" posttime="P%dD" priority="%s" xsi:type="operation_time_per">\n' "<item name=%s/><location name=%s/>\n" % (
                             quoteattr(operation),
-                            self.convert_float_time(duration_per)
-                            if duration_per and duration_per > 0
-                            else "P0D",
+                            (
+                                self.convert_float_time(duration_per)
+                                if duration_per and duration_per > 0
+                                else "P0D"
+                            ),
                             self.manufacturing_lead,
                             i["sequence"] or 1,
                             quoteattr(product_buf["name"]),
@@ -1028,9 +1050,9 @@ class exporter(object):
                         convertedQty,
                         quoteattr(product_buf["name"]),
                     )
-                    self.bom_producedQty[
-                        (operation, product_buf["name"])
-                    ] = convertedQty
+                    self.bom_producedQty[(operation, product_buf["name"])] = (
+                        convertedQty
+                    )
 
                     # Build consuming flows.
                     # If the same component is consumed multiple times in the same BOM
@@ -1086,9 +1108,11 @@ class exporter(object):
                             if not product:
                                 continue
                             yield '<flow xsi:type="%s" quantity="%f"><item name=%s/></flow>\n' % (
-                                "flow_fixed_end"
-                                if j["subproduct_type"] == "fixed"
-                                else "flow_end",
+                                (
+                                    "flow_fixed_end"
+                                    if j["subproduct_type"] == "fixed"
+                                    else "flow_end"
+                                ),
                                 self.convert_qty_uom(
                                     j["product_qty"],
                                     j["product_uom"],
@@ -1114,9 +1138,11 @@ class exporter(object):
                                 j["time_cycle"],
                                 quoteattr(j["search_mode"]),
                                 quoteattr(self.map_workcenters[j["workcenter_id"][0]]),
-                                ("<skill name=%s/>" % quoteattr(j["skill"][1]))
-                                if j["skill"]
-                                else "",
+                                (
+                                    ("<skill name=%s/>" % quoteattr(j["skill"][1]))
+                                    if j["skill"]
+                                    else ""
+                                ),
                             )
                         if exists:
                             yield "</loads>\n"
@@ -1186,16 +1212,20 @@ class exporter(object):
                         yield "<suboperation>" '<operation name=%s priority="%s" duration_per="%s" xsi:type="operation_time_per">\n' "<location name=%s/>\n" '<loads><load quantity="%f" search=%s><resource name=%s/>%s</load></loads>\n' % (
                             quoteattr(name),
                             counter * 10,
-                            self.convert_float_time(step["time_cycle"] / 1440.0)
-                            if step["time_cycle"] and step["time_cycle"] > 0
-                            else "P0D",
+                            (
+                                self.convert_float_time(step["time_cycle"] / 1440.0)
+                                if step["time_cycle"] and step["time_cycle"] > 0
+                                else "P0D"
+                            ),
                             quoteattr(location),
                             1,
                             quoteattr(step["search_mode"]),
                             quoteattr(self.map_workcenters[step["workcenter_id"][0]]),
-                            ("<skill name=%s/>" % quoteattr(step["skill"][1]))
-                            if step["skill"]
-                            else "",
+                            (
+                                ("<skill name=%s/>" % quoteattr(step["skill"][1]))
+                                if step["skill"]
+                                else ""
+                            ),
                         )
                         first_flow = True
                         if counter == len(steplist):
@@ -1207,7 +1237,12 @@ class exporter(object):
                                 * uom_factor,
                                 quoteattr(product_buf["name"]),
                             )
-                            self.bom_producedQty[(name, product_buf["name"],)] = (
+                            self.bom_producedQty[
+                                (
+                                    name,
+                                    product_buf["name"],
+                                )
+                            ] = (
                                 i["product_qty"]
                                 * getattr(i, "product_efficiency", 1.0)
                                 * uom_factor
@@ -1511,36 +1546,30 @@ class exporter(object):
 
     def export_manufacturingorders(self):
         """
-        Extracting work in progress to frePPLe, using the mrp.production model.
+        Extracting work in progress to frePPLe, using the mrp.forecast model.
+        This is an inno customization
 
-        We extract workorders in the states 'in_production' and 'confirmed', and
-        which have a bom specified.
-
-        Mapping:
-        mrp.production.bom_id mrp.production.bom_id.name @ mrp.production.location_dest_id -> operationplan.operation
-        convert mrp.production.product_qty and mrp.production.product_uom -> operationplan.quantity
-        mrp.production.date_planned -> operationplan.start
-        '1' -> operationplan.status = "confirmed"
         """
         yield "<!-- manufacturing orders in progress -->\n"
         yield "<operationplans>\n"
         for i in self.generator.getData(
-            "mrp.production",
-            search=[("state", "in", ["progress", "confirmed", "to_close"])],
+            "mrp.forecast",
+            search=[("state", "in", ["progress", "confirmed", "to_close", "forecast"])],
             fields=[
-                "bom_id",
-                "date_start",
-                "date_planned_start",
+                "operation",
+                "start_date",  # date
+                "date_planned_start",  # datetime
                 "name",
                 "state",
-                "product_qty",
-                "product_uom_id",
-                "location_dest_id",
+                "quantity",
+                "uom_id",
                 "product_id",
             ],
         ):
-            if i["bom_id"]:
+
+            if i["operation"]:
                 # Open orders
+                bom_id = int(i["operation"].split(" ")[-1])
                 location = (
                     "GN-WH"  # self.map_locations.get(i["location_dest_id"][0], None)
                 )
@@ -1554,11 +1583,13 @@ class exporter(object):
                 operation = "%s @ %s %d" % (
                     item["name"],
                     location,
-                    i["bom_id"][0],
+                    bom_id,
                 )
                 try:
                     startdate = self.formatDateTime(
-                        i["date_start"] if i["date_start"] else i["date_planned_start"]
+                        datetime.combine(i["start_date"], datetime.min.time())
+                        if i["start_date"]
+                        else i["date_planned_start"]
                     )
                 except Exception:
                     continue
@@ -1571,8 +1602,8 @@ class exporter(object):
                 )
                 qty = (
                     self.convert_qty_uom(
-                        i["product_qty"],
-                        i["product_uom_id"],
+                        i["quantity"],
+                        i["uom_id"],
                         self.product_product[i["product_id"][0]]["template"],
                     )
                     / factor
@@ -1611,7 +1642,7 @@ class exporter(object):
             # we have no location to grab, pick any warehouse
             # location aggregation in commands.py will do the job
 
-            name = u"%s @ %s" % (self.product_product[i]["name"], "GN-WH")
+            name = "%s @ %s" % (self.product_product[i]["name"], "GN-WH")
             yield """
             <calendar name=%s default="0"><buckets>
             <bucket start="2000-01-01T00:00:00" end="2030-01-01T00:00:00" value="%s" days="127" priority="998" starttime="PT0M" endtime="PT1440M"/>
@@ -1668,7 +1699,7 @@ class exporter(object):
                 i["product_uom"][0],
                 self.product_product[i["product_id"][0]]["template"],
             )
-            name = u"%s @ %s" % (item["name"], i["warehouse_id"][1])
+            name = "%s @ %s" % (item["name"], i["warehouse_id"][1])
             if i["product_min_qty"]:
                 yield """
                 <calendar name=%s default="0"><buckets>
