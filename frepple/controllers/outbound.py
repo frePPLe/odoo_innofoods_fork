@@ -1022,19 +1022,9 @@ class exporter(object):
                             quoteattr(location),
                         )
                     else:
-                        duration_per = (
-                            self.product_templates[i["product_tmpl_id"][0]][
-                                "produce_delay"
-                            ]
-                            / 1440.0
-                        )
                         yield '<operation name=%s size_multiple="1" duration_per="%s" posttime="P%dD" priority="%s" xsi:type="operation_time_per">\n' "<item name=%s/><location name=%s/>\n" % (
                             quoteattr(operation),
-                            (
-                                self.convert_float_time(duration_per)
-                                if duration_per and duration_per > 0
-                                else "P0D"
-                            ),
+                            "P0D",
                             self.manufacturing_lead,
                             i["sequence"] or 1,
                             quoteattr(product_buf["name"]),
@@ -1212,11 +1202,7 @@ class exporter(object):
                         yield "<suboperation>" '<operation name=%s priority="%s" duration_per="%s" xsi:type="operation_time_per">\n' "<location name=%s/>\n" '<loads><load quantity="%f" search=%s><resource name=%s/>%s</load></loads>\n' % (
                             quoteattr(name),
                             counter * 10,
-                            (
-                                self.convert_float_time(step["time_cycle"] / 1440.0)
-                                if step["time_cycle"] and step["time_cycle"] > 0
-                                else "P0D"
-                            ),
+                            "P0D",
                             quoteattr(location),
                             1,
                             quoteattr(step["search_mode"]),
