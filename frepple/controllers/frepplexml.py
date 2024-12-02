@@ -102,6 +102,7 @@ class XMLController(odoo.http.Controller):
                     timezone=kwargs.get("timezone", None),
                     singlecompany=kwargs.get("singlecompany", "false").lower()
                     == "true",
+                    use_mrp_forecast=int(kwargs.get("use_mrp_forecast", 0)),
                 )
                 try:
                     tmpfile = NamedTemporaryFile(mode="w+t", delete=False)
