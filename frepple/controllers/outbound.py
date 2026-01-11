@@ -1481,9 +1481,6 @@ class exporter(object):
                                 quoteattr(location),
                             )
                         else:
-                            duration = (i["produce_delay"] or 0) + (
-                                i["days_to_prepare_mo"] or 0
-                            )
 
                             yield '<operation name=%s %ssize_multiple="1" duration="%s" posttime="P%dD" priority="%s" category=%s xsi:type="operation_fixed_time">\n' "<item name=%s/><location name=%s/>\n" % (
                                 quoteattr(operation),
@@ -1492,11 +1489,7 @@ class exporter(object):
                                     if i["code"]
                                     else ""
                                 ),
-                                (
-                                    self.convert_float_time(duration)
-                                    if duration and duration > 0
-                                    else "P0D"
-                                ),
+                                "P0D",
                                 self.manufacturing_lead,
                                 100 + (i["sequence"] or 1),
                                 quoteattr(i["type"] or ""),
