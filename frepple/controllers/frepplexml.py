@@ -320,6 +320,7 @@ class XMLController(odoo.http.Controller):
                     delta=float(kwargs.get("delta", 999)),
                     language=language,
                     apps=apps,
+                    use_mrp_forecast=int(kwargs.get("use_mrp_forecast", 0)),
                 )
 
                 # last empty double quote is to let python understand frepple is a folder.

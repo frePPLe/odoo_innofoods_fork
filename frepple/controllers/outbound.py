@@ -118,6 +118,7 @@ class exporter(object):
         delta=999,
         language="en_US",
         apps="",
+        use_mrp_forecast=0,
     ):
         self.database = database
         self.company = company
@@ -150,6 +151,7 @@ class exporter(object):
         self.has_length_limits = self.version[0] < 9 or (
             self.version[0] == 9 and self.version[1] < 11
         )
+        self.use_mrp_forecast = use_mrp_forecast
 
         # The mode argument defines different types of runs:
         #  - Mode 1:
@@ -244,8 +246,13 @@ class exporter(object):
         if self.mode == 1:
             logger.debug("Exporting purchase orders.")
             yield from self.export_purchaseorders()
+
             logger.debug("Exporting manufacturing orders.")
-            yield from self.export_manufacturingorders()
+            if self.use_mrp_forecast:
+                yield from self.export_mrp_forecast()
+            else:
+                yield self.export_manufacturingorders()
+
             logger.debug("Exporting reordering rules.")
             yield from self.export_orderpoints()
 
@@ -2427,7 +2434,86 @@ class exporter(object):
                     )
         yield "</operationplans>\n"
 
-    def export_manufacturingorders(self):
+
+
+
+    def export_mrp_forecast(self):
+        """
+        Extracting work in progress to frePPLe, using the mrp.forecast model.
+        This is an inno customization
+
+        """
+        yield "<!-- manufacturing orders in progress -->\n"
+        yield "<operationplans>\n"
+        for i in self.generator.getData(
+            "mrp.forecast",
+            search=[("state", "in", ["progress", "confirmed", "to_close", "forecast"])],
+            fields=[
+                "operation",
+                "start_date",  # date
+                "date_planned_start",  # datetime
+                "name",
+                "state",
+                "quantity",
+                "uom_id",
+                "product_id",
+            ],
+        ):
+
+            if i["operation"]:
+                # Open orders
+                bom_id = int(i["operation"].split(" ")[-1])
+                location = (
+                    "GN-WH"  # self.map_locations.get(i["location_dest_id"][0], None)
+                )
+                item = (
+                    self.product_product[i["product_id"][0]]
+                    if i["product_id"][0] in self.product_product
+                    else None
+                )
+                if not item or not location:
+                    continue
+                operation = "%s @ %s %d" % (
+                    item["name"],
+                    location,
+                    bom_id,
+                )
+                try:
+                    startdate = self.formatDateTime(
+                        datetime.combine(i["start_date"], datetime.min.time())
+                        if i["start_date"]
+                        else i["date_planned_start"]
+                    )
+                except Exception:
+                    continue
+                if operation not in self.operations:
+                    continue
+                factor = (
+                    self.bom_producedQty[(operation, item["name"])]
+                    if (operation, i["name"]) in self.bom_producedQty
+                    else 1
+                )
+                qty = (
+                    self.convert_qty_uom(
+                        i["quantity"],
+                        i["uom_id"],
+                        self.product_product[i["product_id"][0]]["template"],
+                    )
+                    / factor
+                )
+                yield '<operationplan type="MO" reference=%s start="%s" quantity="%s" status="%s"><operation name=%s/></operationplan>\n' % (
+                    quoteattr(i["name"]),
+                    startdate,
+                    qty,
+                    # "approved",  # In the "approved" status, frepple can still reschedule the MO in function of material and capacity
+                    "confirmed",  # In the "confirmed" status, frepple sees the MO as frozen and unchangeable
+                    quoteattr(operation),
+                )
+        yield "</operationplans>\n"
+
+
+
+    def export_mrp_forecast(self):
         """
         Extracting work in progress to frePPLe, using the mrp.production model.
 
@@ -2482,7 +2568,9 @@ class exporter(object):
             object=True,
         ):
             # Filter out irrelevant manufacturing orders
-            location = self.map_locations.get(i.location_dest_id.id, None)
+            location = location = (
+                    "GN-WH"  # self.map_locations.get(i["location_dest_id"][0], None)
+                )
             operation = i.name
             type = "MO"
             if not location and i.picking_type_id:
