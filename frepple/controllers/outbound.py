@@ -469,6 +469,9 @@ class exporter(object):
             # Read the timezone
             for i in self.generator.getData(
                 "resource.calendar",
+                search=[
+                    ("id", "!=", 4)
+                ],  # temp: Holyday calendar makes the connectors crash
                 fields=[
                     "name",
                     "tz",
@@ -2427,9 +2430,6 @@ class exporter(object):
                     )
         yield "</operationplans>\n"
 
-
-
-
     def export_mrp_forecast(self):
         """
         Extracting work in progress to frePPLe, using the mrp.forecast model.
@@ -2504,8 +2504,6 @@ class exporter(object):
                 )
         yield "</operationplans>\n"
 
-
-
     def export_mrp_forecast(self):
         """
         Extracting work in progress to frePPLe, using the mrp.production model.
@@ -2562,8 +2560,8 @@ class exporter(object):
         ):
             # Filter out irrelevant manufacturing orders
             location = location = (
-                    "GN-WH"  # self.map_locations.get(i["location_dest_id"][0], None)
-                )
+                "GN-WH"  # self.map_locations.get(i["location_dest_id"][0], None)
+            )
             operation = i.name
             type = "MO"
             if not location and i.picking_type_id:
