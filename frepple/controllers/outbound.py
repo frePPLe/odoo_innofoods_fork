@@ -2504,7 +2504,7 @@ class exporter(object):
                 )
         yield "</operationplans>\n"
 
-    def export_mrp_forecast(self):
+    def export_manufacturingorders(self):
         """
         Extracting work in progress to frePPLe, using the mrp.production model.
 
