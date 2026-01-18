@@ -1080,30 +1080,30 @@ class exporter(object):
         # Check if we can use short names
         # To use short names, the internal reference (or the name when no internal reference is defined)
         # needs to be unique
-        use_short_names = True
+        use_short_names = False
 
-        self.generator.env.cr.execute(
-            """
-            select count(*) from
-            (
-            select coalesce(product_product.default_code,
-            product_template.name->>%s,
-            product_template.name->>'en_US'), count(*)
-            from product_product
-            inner join product_template on product_product.product_tmpl_id = product_template.id
-            where product_template.type not in ('service', 'combo')
-            group by coalesce(product_product.default_code,
-            product_template.name->>%s,
-            product_template.name->>'en_US')
-            having count(*) > 1
-            ) t
-            """,
-            (self.language, self.language),
-        )
-        for i in self.generator.env.cr.fetchall():
-            if i[0] > 0:
-                use_short_names = False
-                break
+        # self.generator.env.cr.execute(
+        #     """
+        #     select count(*) from
+        #     (
+        #     select coalesce(product_product.default_code,
+        #     product_template.name->>%s,
+        #     product_template.name->>'en_US'), count(*)
+        #     from product_product
+        #     inner join product_template on product_product.product_tmpl_id = product_template.id
+        #     where product_template.type not in ('service', 'combo')
+        #     group by coalesce(product_product.default_code,
+        #     product_template.name->>%s,
+        #     product_template.name->>'en_US')
+        #     having count(*) > 1
+        #     ) t
+        #     """,
+        #     (self.language, self.language),
+        # )
+        # for i in self.generator.env.cr.fetchall():
+        #     if i[0] > 0:
+        #         use_short_names = False
+        #         break
 
         supplierinfo_fields = [
             "product_tmpl_id",
