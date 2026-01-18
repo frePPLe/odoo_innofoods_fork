@@ -1361,6 +1361,11 @@ class exporter(object):
 
         self.operations = set()
 
+        # dictionary used to divide the confirmed MO quantities
+        # key is tuple (operation name, produced item)
+        # value is quantity in Operation Materials.
+        self.bom_producedQty = {}
+
         for i in self.generator.getData(
             "mrp.routing.workcenter",
             order="bom_id, sequence, id asc",
@@ -1712,6 +1717,16 @@ class exporter(object):
 
                         # Handle produced quantity of a bom
                         producedQty = (
+                            i["product_qty"]
+                            * getattr(i, "product_efficiency", 1.0)
+                            * uom_factor
+                        )
+                        self.bom_producedQty[
+                            (
+                                operation,
+                                product_buf["name"],
+                            )
+                        ] = (
                             i["product_qty"]
                             * getattr(i, "product_efficiency", 1.0)
                             * uom_factor
