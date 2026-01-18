@@ -253,15 +253,11 @@ class exporter(object):
             # else:
             #     yield self.export_manufacturingorders()
 
-            logger.debug("Exporting reordering rules.")
-            yield from self.export_orderpoints()
+            logger.debug("Exporting minimum stock_level.")
+            yield from self.export_minimum_stock_level()
 
-            if self.has_expiry:
-                logger.debug("Exporting stock orders.")
-                yield from self.export_stockorders()
-            else:
-                logger.debug("Exporting quantities on-hand.")
-                yield from self.export_onhand()
+            logger.debug("Exporting quantities on-hand.")
+            yield from self.export_onhand()
 
         # Footer
         yield "</plan>\n"
@@ -1068,6 +1064,8 @@ class exporter(object):
                 "route_ids",
                 "product_tag_ids",
                 "type",
+                "minimum_stock_level",
+                "responsible_id",
             ]
             + (
                 [
@@ -1246,6 +1244,12 @@ class exporter(object):
                     else ""
                 ),
             )
+
+            if tmpl["responsible_id"]:
+                yield '<stringproperty name="responsible" value=%s/>' % (
+                    quoteattr(tmpl["responsible_id"][1]),
+                )
+
             # Export suppliers for the item, if the item is allowed to be purchased
             if tmpl["purchase_ok"]:
                 suppliers = {}
@@ -1356,12 +1360,6 @@ class exporter(object):
         mrp_routing_workcenters = {}
         for i in self.generator.getData(
             "mrp.routing.workcenter",
-            search=[
-                ("code", "not ilike", "unpack"),
-                ("code", "not ilike", "rework"),
-                ("code", "not ilike", "rebake"),
-                ("code", "not ilike", "re-bake"),
-            ],
             order="bom_id, sequence, id asc",
             fields=[
                 "name",
@@ -1402,6 +1400,12 @@ class exporter(object):
         # Loop over all bom records
         for i in self.generator.getData(
             "mrp.bom",
+            search=[
+                ("code", "not ilike", "unpack"),
+                ("code", "not ilike", "rework"),
+                ("code", "not ilike", "rebake"),
+                ("code", "not ilike", "re-bake"),
+            ],
             fields=[
                 "product_qty",
                 "product_uom_id",
@@ -3213,3 +3217,40 @@ class exporter(object):
                 quoteattr(key[1]),
             )
         yield "</buffers>\n"
+
+    def export_minimum_stock_level(self):
+        """
+        Read minimum stock levels from product_template.
+        If minimum stock level is defined, the reordering rules are ignored
+        for this product
+        """
+        first = True
+        self.hasMinimumStock = []
+
+        for i in self.product_product:
+            tmpl = self.product_templates[self.product_product[i]["template"]]
+            if not tmpl["minimum_stock_level"]:
+                continue
+
+            self.hasMinimumStock.append(i)
+
+            if first:
+                yield "<!-- minimum stock levels -->\n"
+                yield "<calendars>\n"
+                first = False
+
+            # we have no location to grab, pick any warehouse
+            # location aggregation in commands.py will do the job
+
+            name = "%s @ %s" % (self.product_product[i]["name"], "GN-WH")
+            yield """
+            <calendar name=%s default="0"><buckets>
+            <bucket start="2000-01-01T00:00:00" end="2030-01-01T00:00:00" value="%s" days="127" priority="998" starttime="PT0M" endtime="PT1440M"/>
+            </buckets>
+            </calendar>\n
+            """ % (
+                (quoteattr("SS for %s" % (name,))),
+                (tmpl["minimum_stock_level"]),
+            )
+        if not first:
+            yield "</calendars>\n"
