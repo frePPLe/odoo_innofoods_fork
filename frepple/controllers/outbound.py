@@ -1356,6 +1356,12 @@ class exporter(object):
         mrp_routing_workcenters = {}
         for i in self.generator.getData(
             "mrp.routing.workcenter",
+            search=[
+                ("code", "not ilike", "unpack"),
+                ("code", "not ilike", "rework"),
+                ("code", "not ilike", "rebake"),
+                ("code", "not ilike", "re-bake"),
+            ],
             order="bom_id, sequence, id asc",
             fields=[
                 "name",
