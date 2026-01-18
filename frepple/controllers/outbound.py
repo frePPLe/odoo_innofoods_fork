@@ -1358,6 +1358,9 @@ class exporter(object):
 
         # Read all workcenters of all routings
         mrp_routing_workcenters = {}
+
+        self.operations = set()
+
         for i in self.generator.getData(
             "mrp.routing.workcenter",
             order="bom_id, sequence, id asc",
@@ -1468,6 +1471,7 @@ class exporter(object):
                             product_buf["name"][: 300 - len(suffix)],
                             suffix,
                         )
+                    self.operations.add(operation)
                     if (
                         not self.manage_work_orders
                         or subcontractor
@@ -2573,6 +2577,8 @@ class exporter(object):
                 "GN-WH"  # self.map_locations.get(i["location_dest_id"][0], None)
             )
             operation = i.name
+            if operation not in self.operations:
+                continue
             type = "MO"
             if not location and i.picking_type_id:
                 # For subcontracting MO we find the warehouse on the operation type
