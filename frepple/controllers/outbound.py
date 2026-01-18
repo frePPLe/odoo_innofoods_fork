@@ -248,10 +248,10 @@ class exporter(object):
             yield from self.export_purchaseorders()
 
             logger.debug("Exporting manufacturing orders.")
-            # if self.use_mrp_forecast:
-            #     yield from self.export_mrp_forecast()
-            # else:
-            #     yield self.export_manufacturingorders()
+            if self.use_mrp_forecast or True:
+                yield from self.export_mrp_forecast()
+            else:
+                yield self.export_manufacturingorders()
 
             logger.debug("Exporting minimum stock_level.")
             yield from self.export_minimum_stock_level()
