@@ -1458,7 +1458,7 @@ class exporter(object):
                     # Build operation. The operation can either be a summary operation or a detailed
                     # routing.
                     operation = "%s @ %s %d" % (
-                        product_buf["code"] or product_buf["name"],
+                        product_buf["name"],
                         subcontractor.get("name", location),
                         i["id"],
                     )
