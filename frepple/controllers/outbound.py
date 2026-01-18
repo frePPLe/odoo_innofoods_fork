@@ -248,7 +248,7 @@ class exporter(object):
             yield from self.export_purchaseorders()
 
             logger.debug("Exporting manufacturing orders.")
-            if self.use_mrp_forecast or True:
+            if self.use_mrp_forecast and False:
                 yield from self.export_mrp_forecast()
             else:
                 yield self.export_manufacturingorders()
