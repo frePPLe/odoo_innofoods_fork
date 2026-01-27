@@ -1878,13 +1878,7 @@ class exporter(object):
                                     else ""
                                 ),
                                 counter * 10,
-                                (
-                                    self.convert_float_time(
-                                        step["time_cycle"] / workcenter_qty / 1440.0
-                                    )
-                                    if step["time_cycle"] and step["time_cycle"] > 0
-                                    else "P0D"
-                                ),
+                                "P0D",
                                 quoteattr(i["type"] or ""),
                                 (
                                     self.convert_float_time(
