@@ -2668,7 +2668,8 @@ class exporter(object):
                 # In the "confirmed" status, frepple sees the MO as frozen and unchangeable
                 (
                     "approved"
-                    if self.manage_work_orders or i.state in ("confirmed", "draft")
+                    if False
+                    and (self.manage_work_orders or i.state in ("confirmed", "draft"))
                     else "confirmed"
                 ),
             )
