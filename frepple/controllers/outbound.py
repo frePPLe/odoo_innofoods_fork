@@ -2555,21 +2555,41 @@ class exporter(object):
                 )
             ]
             # a second call to get the reserved quantities
-            reserved_quantity = {}
-            for i in self.generator.getData(
+            moves = self.generator.getData(
                 "stock.move",
                 search=[
                     ("state", "in", ["partially_available", "assigned"]),
                     ("production_id", "=", False),
                     ("workorder_id", "=", False),
-                    ("origin", "in", confirmed_mos),
+                    ("raw_material_production_id", "in", confirmed_mos),
                 ],
-                fields=["origin", "product_id", "quantity"],
-            ):
-                reserved_quantity[(i["origin"], i["product_id"][0])] = (
-                    reserved_quantity.get((i["origin"], i["product_id"][0]), 0)
-                    + i["quantity"]
-                )
+                fields=["raw_material_production_id", "product_id", "move_line_ids"],
+            )
+            all_line_ids = []
+            for m in moves:
+                all_line_ids.extend(m["move_line_ids"])
+            reserved_quantity = {}
+            if all_line_ids:
+                line_qty_map = {
+                    l["id"]: l["quantity"]
+                    for l in self.generator.getData(
+                        "stock.move.line",
+                        search=[("id", "in", list(set(all_line_ids)))],
+                        fields=["quantity"],
+                    )
+                }
+                for m in moves:
+                    for line_id in m["move_line_ids"]:
+                        reserved_quantity[
+                            (m["raw_material_production_id"][1], m["product_id"][0])
+                        ] = reserved_quantity.get(
+                            (m["raw_material_production_id"][1], m["product_id"][0]), 0
+                        ) + line_qty_map.get(
+                            line_id, 0
+                        )
+            # Release temp variables
+            all_line_ids = None
+            moves = None
 
         yield "<!-- manufacturing orders in progress -->\n"
         yield "<operationplans>\n"
@@ -2582,12 +2602,8 @@ class exporter(object):
             object=True,
         ):
             # Filter out irrelevant manufacturing orders
-            location = location = (
-                "GN-WH"  # self.map_locations.get(i["location_dest_id"][0], None)
-            )
+            location = "GN-WH"
             operation = i.name
-            if operation not in self.operations:
-                continue
             type = "MO"
             if not location and i.picking_type_id:
                 # For subcontracting MO we find the warehouse on the operation type
@@ -2677,17 +2693,21 @@ class exporter(object):
                     consumed_item = self.product_product.get(mv.product_id.id, None)
                     if not consumed_item:
                         continue
-                    qty_flow = max(
-                        0,
-                        mv.product_qty
-                        - (mv.quantity if self.respect_reservations else 0),
+                    reserved = (
+                        max(
+                            reserved_quantity.get((i["name"], mv.product_id.id), 0),
+                            mv.product_qty,
+                        )
+                        if self.respect_reservations
+                        else 0
                     )
+                    qty_flow = mv.product_qty - reserved
                     # subtract the reserved quantity if product is twice in the BOM
                     if self.respect_reservations:
                         reserved_quantity[(i["name"], mv.product_id.id)] = max(
                             0,
                             reserved_quantity.get((i["name"], mv.product_id.id), 0)
-                            - mv.product_qty,
+                            - reserved,
                         )
                     if qty_flow > 0:
                         operation_materials[consumed_item["name"]] = (
@@ -2805,10 +2825,14 @@ class exporter(object):
                                 - mv["product_qty"],
                             )
                         if qty_flow > 0:
-                            yield '<flow quantity="%s"><item name=%s/></flow>\n' % (
-                                -qty_flow / qty,
-                                quoteattr(item["name"]),
-                            )
+                            operation_materials[item["name"]] = operation_materials.get(
+                                item["name"], 0
+                            ) + (-qty_flow / qty)
+                    for key, val in operation_materials.items():
+                        yield '<flow xsi:type="flow_start" quantity="%s"><item name=%s/></flow>\n' % (
+                            val,
+                            quoteattr(key),
+                        )
                     yield "</flows>"
                     if (
                         wo.operation_id
