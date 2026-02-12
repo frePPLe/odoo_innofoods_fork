@@ -2914,12 +2914,11 @@ class exporter(object):
 
                     # In the "approved" status, frepple can still reschedule the MO in function of material and capacity
                     # In the "confirmed" status, frepple sees the MO as frozen and unchangeable
-                    if wo.state == "progress":
-                        state = "confirmed"
-                    elif wo.state in ("done", "to_close", "cancel"):
+
+                    if wo.state in ("done", "to_close", "cancel"):
                         state = "completed"
                     else:
-                        state = "approved"
+                        state = "confirmed"
                     try:
                         if wo.date_finished:
                             wo_date = ' end="%s"' % self.formatDateTime(
