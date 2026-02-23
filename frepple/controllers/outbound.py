@@ -3226,6 +3226,7 @@ class exporter(object):
                 "WHERE quantity > 0 "
                 "AND stock_location.scrap_location is distinct from true "
                 "AND stock_location.usage = 'internal' "
+                "AND stock_location.mps_location = true "
                 "GROUP BY product_id, stock_quant.location_id "
                 "ORDER BY stock_quant.location_id ASC"
             )
