@@ -1082,29 +1082,6 @@ class exporter(object):
         # needs to be unique
         use_short_names = False
 
-        # self.generator.env.cr.execute(
-        #     """
-        #     select count(*) from
-        #     (
-        #     select coalesce(product_product.default_code,
-        #     product_template.name->>%s,
-        #     product_template.name->>'en_US'), count(*)
-        #     from product_product
-        #     inner join product_template on product_product.product_tmpl_id = product_template.id
-        #     where product_template.type not in ('service', 'combo')
-        #     group by coalesce(product_product.default_code,
-        #     product_template.name->>%s,
-        #     product_template.name->>'en_US')
-        #     having count(*) > 1
-        #     ) t
-        #     """,
-        #     (self.language, self.language),
-        # )
-        # for i in self.generator.env.cr.fetchall():
-        #     if i[0] > 0:
-        #         use_short_names = False
-        #         break
-
         supplierinfo_fields = [
             "product_tmpl_id",
             "partner_id",
@@ -1177,6 +1154,13 @@ class exporter(object):
                 name = name[:300]
                 if description:
                     description = description[:500]
+
+            if "rework" in name.lower():
+                continue
+
+            if tmpl["product_tag_ids"]:
+
+
             prod_obj = {
                 "name": name,
                 "template": i["product_tmpl_id"][0],
@@ -2624,7 +2608,7 @@ class exporter(object):
                             operation = code
                             type = "subcontractor"
             item = self.product_product.get(i.product_id.id, None)
-            if not item or "rework" in item["name"].lower() or not location:
+            if not item or not location:
                 continue
 
             # Odoo allows the data on the manufacturing orders and work orders to be
