@@ -1159,7 +1159,15 @@ class exporter(object):
                 continue
 
             if tmpl["product_tag_ids"]:
-
+                category = ", ".join(
+                    [
+                        product_tags[i]
+                        for i in tmpl["product_tag_ids"]
+                        if i in product_tags
+                    ]
+                )
+                if category == "Bulk / Pre-Work":
+                    continue
 
             prod_obj = {
                 "name": name,
