@@ -2624,7 +2624,27 @@ class exporter(object):
                             operation = code
                             type = "subcontractor"
             item = self.product_product.get(i.product_id.id, None)
-            if not item or not location:
+            if not item or "rework" in item["name"].lower() or not location:
+                continue
+
+            # Make sure item category is not Bulk / Pre-Work
+            tmpl = self.product_templates[item["template"]]
+            category = (
+                (
+                    "%s%s"
+                    % (
+                        (
+                            ("%s/" % self.category_parent(tmpl["categ_id"][1]))
+                            if tmpl["categ_id"][1] in self.category_parent
+                            else ""
+                        ),
+                        tmpl["categ_id"][1],
+                    )
+                )
+                if tmpl["categ_id"]
+                else ""
+            )
+            if category == "Bulk / Pre-Work":
                 continue
 
             # Odoo allows the data on the manufacturing orders and work orders to be
@@ -3121,8 +3141,7 @@ class exporter(object):
         yield "<operationplans>\n"
         if isinstance(self.generator, Odoo_generator):
             # SQL query gives much better performance
-            self.generator.env.cr.execute(
-                """
+            self.generator.env.cr.execute("""
                 SELECT stock_quant.product_id,
                 stock_quant.location_id,
                 sum(stock_quant.quantity) as quantity,
@@ -3141,8 +3160,7 @@ class exporter(object):
                 stock_lot.name,
                 stock_lot.expiration_date
                 ORDER BY location_id ASC
-                """
-            )
+                """)
             data = self.generator.env.cr.fetchall()
         else:
             data = [
